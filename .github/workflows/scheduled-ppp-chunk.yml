@@ -1,6 +1,6 @@
 name: PPP chunk (scheduled)
 
-# Run every 2 hours UTC; consumes one tracked data/input/ppp-war_part*.csv per run.
+# Run every 2 hours UTC; consumes one data/input/ppp-war_part*.csv per run (chunks are gitignored; present on runner only if supplied).
 
 on:
   schedule:

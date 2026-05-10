@@ -11,10 +11,9 @@ __pycache__/
 logs/
 *.log
 
-# Master / heavy PPP files stay local-only; chunked parts ARE tracked explicitly.
+# PPP inputs (full CSV, chunks, exports) stay local — not pushed to GitHub.
 data/input/**
 !data/input/.gitkeep
-!data/input/ppp-war_part*.csv
 
 data/input/*.xlsx
 

@@ -1,0 +1,23 @@
+# Local environment
+config/.env
+
+# Cursor / IDE (local workspace)
+.cursor/
+.cursorignore
+
+__pycache__/
+*.pyc
+
+logs/
+*.log
+
+# Master / heavy PPP files stay local-only; chunked parts ARE tracked explicitly.
+data/input/**
+!data/input/.gitkeep
+!data/input/ppp-war_part*.csv
+
+data/input/*.xlsx
+
+# Pipeline scratch — not persisted in git (scheduled jobs write only clean_github_results/)
+data/output/**
+!data/output/.gitkeep

@@ -5,7 +5,7 @@ Run from repo root with PYTHONPATH=.
 
     PYTHONPATH=. python scripts/ci_process_one_chunk.py
 
-Exits 0 immediately if no ``data/input/ppp-war_part*.csv`` files remain.
+Exits 0 immediately if no ``data/input/queue/ppp-war_part*.csv`` files remain.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def _next_chunk(data_input: Path) -> Path | None:
 
 def main() -> int:
     root = _repo_root()
-    data_input = root / "data" / "input"
+    data_input = root / "data" / "input" / "queue"
     clean_dir = root / "clean_github_results"
     clean_dir.mkdir(parents=True, exist_ok=True)
 
@@ -56,8 +56,6 @@ def main() -> int:
             "2000",
             "--oversample-factor",
             "3",
-            "--ppp-csv",
-            str(chunk),
             "--run-dir",
             str(run_dir),
         ]
@@ -69,8 +67,6 @@ def main() -> int:
         shutil.copy2(clean_files[-1], dest_clean)
         print(f"Clean export copied to {dest_clean.relative_to(root)}")
 
-    chunk.unlink()
-    print(f"Deleted consumed chunk {chunk.name}")
     return 0
 
 

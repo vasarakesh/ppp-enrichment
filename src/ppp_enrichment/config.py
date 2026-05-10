@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = BASE_DIR / "data"
 INPUT_DIR = DATA_DIR / "input"
+CHUNK_QUEUE_DIR = INPUT_DIR / "queue"
 OUTPUT_DIR = DATA_DIR / "output"
 
 # Raw PPP data (SBA FOIA extract; place file as shown or symlink to ppp-raw.csv).

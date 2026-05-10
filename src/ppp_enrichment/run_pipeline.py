@@ -1,6 +1,9 @@
 """Single-command orchestration: ingest → domains → enrichment → clean export.
 
+Reads PPP chunks from ``data/input/queue/ppp-war_part*.csv`` unless ``--ppp-csv`` is set.
+
 Usage::
+    python -m src.ppp_enrichment.run_pipeline
     python -m src.ppp_enrichment.run_pipeline --leads 500
 """
 
@@ -8,8 +11,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
-import shutil
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -27,15 +31,17 @@ _CLEAN_COLS = run_export_clean._CLEAN_COLS  # noqa: SLF001 — reuse column map 
 MAX_BORROWERS_PER_RUN = 2000
 
 
-def _loan_number_column_name(df: pd.DataFrame) -> str:
-    """Resolve the normalized loan id column in a FOIA-style PPP frame."""
-    for alias in ingest.CANONICAL_ALIASES["loan_number"]:
-        if alias in df.columns:
-            return alias
-    raise ValueError(
-        "PPP raw CSV has no recognizable loan number column "
-        f"(checked aliases for loan_number: {ingest.CANONICAL_ALIASES['loan_number']!r})."
-    )
+def get_next_chunk() -> Path:
+    """Return the alphabetically first ``ppp-war_part*.csv`` under ``data/input/queue/``."""
+    queue_dir = config.CHUNK_QUEUE_DIR
+    if not queue_dir.is_dir():
+        print("Queue is empty. No chunks remaining.")
+        sys.exit(0)
+    parts = sorted(queue_dir.glob("ppp-war_part*.csv"))
+    if not parts:
+        print("Queue is empty. No chunks remaining.")
+        sys.exit(0)
+    return parts[0]
 
 
 def _cell_to_domain(value: object) -> str:
@@ -170,8 +176,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--leads",
         type=int,
-        required=True,
-        help="Target number of clean leads to produce.",
+        default=1000,
+        help="Target number of clean leads to produce (default: 1000).",
     )
     parser.add_argument(
         "--oversample-factor",
@@ -211,10 +217,8 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     leads: int = args.leads
     oversample: float = args.oversample_factor
-    ppp_input = args.ppp_csv.resolve() if args.ppp_csv is not None else None
-    chunk_mode = ppp_input is not None
-    # Chunk imports are ephemeral; never trim the master PPP remainder from chunk mode.
-    update_master_ppp: bool = (not chunk_mode) and bool(args.update_master_ppp)
+    explicit_ppp_csv = args.ppp_csv is not None
+    ppp_csv_path = args.ppp_csv.resolve() if explicit_ppp_csv else get_next_chunk()
 
     if leads < 1:
         raise ValueError("--leads must be a positive integer.")
@@ -249,27 +253,10 @@ def main(argv: list[str] | None = None) -> None:
             run_dir,
         )
 
-        ppp_csv_path = ppp_input if ppp_input is not None else config.PPP_RAW_PATH
-
-        if not chunk_mode:
-            if not config.PPP_RAW_BACKUP_PATH.exists():
-                if not config.PPP_RAW_PATH.exists():
-                    raise FileNotFoundError(
-                        f"PPP raw file not found: {config.PPP_RAW_PATH} "
-                        "(cannot create backup or load working set)."
-                    )
-                shutil.copy2(config.PPP_RAW_PATH, config.PPP_RAW_BACKUP_PATH)
-                logger.info(
-                    "Created one-time raw backup: %s <- %s",
-                    config.PPP_RAW_BACKUP_PATH,
-                    config.PPP_RAW_PATH,
-                )
-        else:
-            if not ppp_csv_path.exists():
-                raise FileNotFoundError(f"PPP chunk file not found: {ppp_csv_path}")
+        if not ppp_csv_path.exists():
+            raise FileNotFoundError(f"PPP chunk file not found: {ppp_csv_path}")
 
         full_df = ingest.load_ppp_csv(ppp_csv_path)
-        loan_col = _loan_number_column_name(full_df)
 
         target_borrowers = int(leads * oversample)
         target_borrowers = min(target_borrowers, MAX_BORROWERS_PER_RUN, len(full_df))
@@ -320,20 +307,10 @@ def main(argv: list[str] | None = None) -> None:
         clean_df.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
         logger.info("Clean export: %s rows -> %s", clean_count, clean_path)
 
-        if chunk_mode:
-            logger.info(
-                "Chunk mode: skipping master PPP remainder write (processed file: %s).",
-                ppp_csv_path,
-            )
-        elif update_master_ppp:
-            remaining_df = full_df[~full_df[loan_col].isin(raw_sample[loan_col])]
-            remaining_df.to_csv(config.PPP_RAW_PATH, index=False)
-            remaining_n = len(remaining_df)
-            msg_remaining = f"Remaining raw PPP rows after this run: {remaining_n}."
-            logger.info(msg_remaining)
-            print(msg_remaining)
-        else:
-            logger.info("--no-update-master-ppp: skipping write of remainder to master PPP.")
+        logger.info(
+            "Chunk mode: skipping master PPP remainder write (processed file: %s).",
+            ppp_csv_path,
+        )
 
         print(f"Requested leads: {leads}")
         print(f"Borrower sample size: {target_borrowers}")
@@ -343,6 +320,16 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Duplicate rows removed: {clean_stats['dropped_duplicates']}")
         print(f"Clean leads produced: {clean_count}")
         print(f"Run directory: {run_dir}")
+
+        if not explicit_ppp_csv:
+            os.remove(ppp_csv_path)
+            remaining_n = len(
+                sorted(config.CHUNK_QUEUE_DIR.glob("ppp-war_part*.csv"))
+            )
+            print(
+                f"Processed chunk: {ppp_csv_path.name} — deleted from queue.\n"
+                f"Chunks remaining: {remaining_n}"
+            )
     finally:
         root_log.removeHandler(run_handler)
         run_handler.close()

@@ -11,11 +11,11 @@ __pycache__/
 logs/
 *.log
 
-# PPP inputs (full CSV, chunks, exports) stay local — not pushed to GitHub.
-data/input/**
-!data/input/.gitkeep
-!data/input/queue/
-!data/input/queue/.gitkeep
+# Ignore raw large source files (only CSVs sitting directly under data/input/).
+data/input/*.csv
+
+# But DO track the split queue chunks
+!data/input/queue/*.csv
 
 data/input/*.xlsx
 

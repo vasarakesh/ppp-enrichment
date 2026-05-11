@@ -11,6 +11,7 @@ permissions:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 350   # 5h50m — GitHub kills at 6h, this exits cleanly at 5h50m
 
     steps:
       - name: Checkout repo
@@ -45,9 +46,9 @@ jobs:
             echo "Found $COUNT chunk(s) in queue."
           fi
 
-      - name: Run pipeline (1000 leads)
+      - name: Run pipeline (500 leads)
         if: steps.check_queue.outputs.chunks_available != '0'
-        run: python -m src.ppp_enrichment.run_pipeline --leads 1000
+        run: python -m src.ppp_enrichment.run_pipeline --leads 500
 
       - name: Commit clean output and deleted chunk back to repo
         if: steps.check_queue.outputs.chunks_available != '0'
@@ -56,5 +57,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/input/queue/
           git add data/output/
-          git diff --staged --quiet || git commit -m "pipeline: run $(date +'%Y-%m-%d %H:%M UTC') — chunk consumed, clean leads saved"
+          git diff --staged --quiet || git commit -m "pipeline: $(date +'%Y-%m-%d %H:%M UTC') — leads processed, chunk updated"
           git push

@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -31,6 +32,8 @@ _CLEAN_COLS = run_export_clean._CLEAN_COLS  # noqa: SLF001 — reuse column map 
 
 # Cap how many raw PPP rows we pull from the working file in one run.
 MAX_BORROWERS_PER_RUN = 2000
+MAX_SECONDS = 4 * 60 * 60  # 4 hours hard stop
+RUN_START = time.time()
 
 
 def get_next_chunk() -> Path:
@@ -78,7 +81,11 @@ def _run_enrichment(sample_df: pd.DataFrame, logger: logging.Logger) -> pd.DataF
         domain_contacts[domain_key] = extract.extract_contact_info(pages)
 
     enriched_rows: list[dict] = []
+    processed = 0
     for _, row in sample_df.iterrows():
+        if time.time() - RUN_START > MAX_SECONDS:
+            print(f"[4HR LIMIT] Stopping at lead {processed}. Saving checkpoint.")
+            break
         row_dict = row.to_dict()
         dk = domain_keys_series[row.name]
         contact_info = domain_contacts.get(dk) if dk else extract.extract_contact_info([])
@@ -99,6 +106,7 @@ def _run_enrichment(sample_df: pd.DataFrame, logger: logging.Logger) -> pd.DataF
             )
         )
         enriched_rows.append(merged)
+        processed += 1
 
     return pd.DataFrame(enriched_rows)
 
@@ -219,6 +227,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     logger = get_logger(__name__)
     args = _parse_args(argv)
+    global RUN_START
+    RUN_START = time.time()
     leads: int = args.leads
     oversample: float = args.oversample_factor
     explicit_ppp_csv = args.ppp_csv is not None
@@ -294,6 +304,8 @@ def main(argv: list[str] | None = None) -> None:
         rows_with_domain = int(wd.notna().sum())
 
         enriched = _run_enrichment(with_domains, logger)
+        processed = len(enriched)
+        skipped = max(len(with_domains) - processed, 0)
         logger.info("Enriched sample: %s rows (in memory).", len(enriched))
 
         clean_df, clean_count, clean_stats = _build_clean_leads(enriched, leads)
@@ -303,6 +315,21 @@ def main(argv: list[str] | None = None) -> None:
         clean_path = config.OUTPUT_DIR / f"clean_leads_{utc_stamp}.csv"
         clean_df.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
         logger.info("Clean export: %s rows -> %s", clean_count, clean_path)
+
+        remaining_df = pd.concat(
+            [
+                raw_sample.iloc[processed:].copy(),
+                full_df.iloc[target_borrowers:].copy(),
+            ],
+            ignore_index=True,
+        )
+        remaining_n = len(remaining_df)
+        if remaining_n == 0:
+            ppp_csv_path.unlink(missing_ok=True)
+            chunk_status = "deleted"
+        else:
+            remaining_df.to_csv(ppp_csv_path, index=False, encoding=config.CSV_WRITE_ENCODING)
+            chunk_status = f"updated with {remaining_n} remaining rows"
 
         logger.info(
             "Chunk mode: skipping master PPP remainder write (processed file: %s).",
@@ -316,19 +343,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Rows dropped due to fake phone: {clean_stats['dropped_fake_phone']}")
         print(f"Duplicate rows removed: {clean_stats['dropped_duplicates']}")
         print(f"Clean leads produced: {clean_count}")
+        print(f"Rows skipped (checkpoint or limits): {skipped}")
         print(f"Clean leads file (UTC): {clean_path}")
         if not cleanup_run_dir:
             print(f"Intermediate directory: {run_dir}")
-
-        if not explicit_ppp_csv:
-            os.remove(ppp_csv_path)
-            remaining_n = len(
-                sorted(config.CHUNK_QUEUE_DIR.glob("ppp-war_part*.csv"))
-            )
-            print(
-                f"Processed chunk: {ppp_csv_path.name} — deleted from queue.\n"
-                f"Chunks remaining: {remaining_n}"
-            )
+        print("=== RUN COMPLETE ===")
+        print(f"Processed: {processed} leads")
+        print(f"Remaining in chunk: {remaining_n} leads")
+        print(f"Output saved to: {clean_path}")
+        print(f"Chunk status: {chunk_status}")
     finally:
         root_log.removeHandler(run_handler)
         run_handler.close()

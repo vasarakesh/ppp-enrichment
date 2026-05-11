@@ -61,9 +61,10 @@ def main() -> int:
         ]
         subprocess.run(cmd, cwd=root, env=env, check=True)
 
-        clean_files = sorted(run_dir.glob("Vaishnavi_Clean_*.csv"))
+        out_dir = root / "data" / "output"
+        clean_files = sorted(out_dir.glob("clean_leads_*.csv"), key=lambda p: p.stat().st_mtime)
         if not clean_files:
-            raise RuntimeError(f"No Vaishnavi_Clean_*.csv in {run_dir}")
+            raise RuntimeError(f"No clean_leads_*.csv in {out_dir}")
         shutil.copy2(clean_files[-1], dest_clean)
         print(f"Clean export copied to {dest_clean.relative_to(root)}")
 

@@ -13,8 +13,10 @@ import argparse
 import logging
 import os
 import re
+import shutil
 import sys
-from datetime import date
+import tempfile
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -101,21 +103,20 @@ def _run_enrichment(sample_df: pd.DataFrame, logger: logging.Logger) -> pd.DataF
     return pd.DataFrame(enriched_rows)
 
 
-def _read_enriched_strict(enriched_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(enriched_path)
+def _validate_enriched_columns(df: pd.DataFrame) -> None:
     missing = [
         internal for _, internal in _CLEAN_COLS if internal not in df.columns
     ]
     if missing:
-        raise KeyError(f"Enriched CSV missing required columns: {missing}")
-    return df
+        raise KeyError(f"Enriched frame missing required columns: {missing}")
 
 
 def _build_clean_leads(
-    enriched_path: Path, max_rows: int
+    enriched_df: pd.DataFrame, max_rows: int
 ) -> tuple[pd.DataFrame, int, dict[str, int]]:
     """Filter, clean columns, limit to ``max_rows``; returns output, count, and stats."""
-    df = _read_enriched_strict(enriched_path)
+    _validate_enriched_columns(enriched_df)
+    df = enriched_df.copy()
     email_ok = df.apply(
         lambda row: run_export_clean._email_passes_clean_filters(  # noqa: SLF001
             row["email"],
@@ -207,7 +208,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--run-dir",
         type=Path,
         default=None,
-        help="Directory for intermediate + clean outputs (default under data/output by date/leads).",
+        help=(
+            "Directory for transient intermediates only (default: system temp). "
+            "Final clean CSV always goes to data/output/clean_leads_<UTC>.csv."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -229,12 +233,13 @@ def main(argv: list[str] | None = None) -> None:
     configure_logging(app_cfg)
 
     today_str = date.today().strftime("%Y%m%d")
+    cleanup_run_dir = False
     if args.run_dir is not None:
         run_dir = Path(args.run_dir).expanduser().resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
     else:
-        run_dir = config.OUTPUT_DIR / f"Data_{leads}_{today_str}"
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="ppp_pipeline_"))
+        cleanup_run_dir = True
 
     run_log = app_cfg.logs_dir / f"pipeline_Data_{leads}_{today_str}.log"
     run_handler = logging.FileHandler(run_log, encoding="utf-8")
@@ -277,33 +282,25 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             slice_path.unlink(missing_ok=True)
 
-        borrower_base_path = run_dir / "borrowers_base_sample.csv"
-        borrower_sample.to_csv(borrower_base_path, index=False)
         logger.info(
-            "Wrote borrower base sample: %s rows (target_borrowers=%s) -> %s",
+            "Borrower base sample: %s rows (target_borrowers=%s).",
             len(borrower_sample),
             target_borrowers,
-            borrower_base_path,
         )
 
         with_domains = domains.attach_domains_to_borrowers(borrower_sample.copy())
-        with_domains_path = run_dir / "borrowers_with_domains.csv"
-        with_domains.to_csv(with_domains_path, index=False)
 
         wd = with_domains["website_domain"]
         rows_with_domain = int(wd.notna().sum())
 
         enriched = _run_enrichment(with_domains, logger)
-        enriched_path = run_dir / "enriched_borrowers.csv"
-        enriched.to_csv(enriched_path, index=False)
-        logger.info(
-            "Wrote enriched sample: %s rows -> %s",
-            len(enriched),
-            enriched_path,
-        )
+        logger.info("Enriched sample: %s rows (in memory).", len(enriched))
 
-        clean_df, clean_count, clean_stats = _build_clean_leads(enriched_path, leads)
-        clean_path = run_dir / f"Vaishnavi_Clean_{clean_count}_1.csv"
+        clean_df, clean_count, clean_stats = _build_clean_leads(enriched, leads)
+
+        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        utc_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
+        clean_path = config.OUTPUT_DIR / f"clean_leads_{utc_stamp}.csv"
         clean_df.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
         logger.info("Clean export: %s rows -> %s", clean_count, clean_path)
 
@@ -319,7 +316,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Rows dropped due to fake phone: {clean_stats['dropped_fake_phone']}")
         print(f"Duplicate rows removed: {clean_stats['dropped_duplicates']}")
         print(f"Clean leads produced: {clean_count}")
-        print(f"Run directory: {run_dir}")
+        print(f"Clean leads file (UTC): {clean_path}")
+        if not cleanup_run_dir:
+            print(f"Intermediate directory: {run_dir}")
 
         if not explicit_ppp_csv:
             os.remove(ppp_csv_path)
@@ -333,6 +332,8 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         root_log.removeHandler(run_handler)
         run_handler.close()
+        if cleanup_run_dir:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

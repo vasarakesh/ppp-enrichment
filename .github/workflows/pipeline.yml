@@ -1,0 +1,60 @@
+name: PPP Enrichment Pipeline
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # runs every 3 hours (00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC)
+  workflow_dispatch:          # allows manual trigger from GitHub Actions UI
+
+permissions:
+  contents: write             # required to commit output files and delete chunks
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check queue is not empty
+        id: check_queue
+        run: |
+          COUNT=$(ls data/input/queue/*.csv 2>/dev/null | wc -l)
+          echo "chunks_available=$COUNT" >> $GITHUB_OUTPUT
+          if [ "$COUNT" -eq "0" ]; then
+            echo "::warning::Queue is empty. No chunk files found in data/input/queue/"
+          else
+            echo "Found $COUNT chunk(s) in queue."
+          fi
+
+      - name: Run pipeline (1000 leads)
+        if: steps.check_queue.outputs.chunks_available != '0'
+        run: python -m src.ppp_enrichment.run_pipeline --leads 1000
+
+      - name: Commit clean output and deleted chunk back to repo
+        if: steps.check_queue.outputs.chunks_available != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/input/queue/
+          git add data/output/
+          git diff --staged --quiet || git commit -m "pipeline: run $(date +'%Y-%m-%d %H:%M UTC') — chunk consumed, clean leads saved"
+          git push

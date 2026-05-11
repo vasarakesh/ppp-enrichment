@@ -19,6 +19,16 @@ data/input/*.csv
 
 data/input/*.xlsx
 
-# Pipeline scratch — not persisted in git (scheduled jobs write only clean_github_results/)
-data/output/**
+# Track ONLY the clean leads output files (whitelist via rules below).
+
+# Ignore everything else in output folder
+data/output/*
 !data/output/.gitkeep
+!data/output/clean_leads_*.csv
+
+# Ignore all temp/intermediate files anywhere
+data/output/raw_*.csv
+data/output/debug_*.csv
+data/output/temp_*.csv
+*.tmp
+*.log

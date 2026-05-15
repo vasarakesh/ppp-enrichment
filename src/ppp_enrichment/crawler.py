@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import re
 import time
@@ -42,6 +42,83 @@ _KEYWORD_PATTERN = re.compile(
 
 # Small redirect cap per request (client-level).
 _CRAWLER_MAX_REDIRECTS = 5
+_NO_RETRY_STATUS_CODES = frozenset({403, 404, 410})
+_RETRY_BACKOFF_SECONDS = 0.5
+
+
+@dataclass
+class HttpStats:
+    """Aggregated HTTP outcomes for the most recent ``crawl_domains`` call."""
+
+    requests: int = 0
+    status_3xx: int = 0
+    status_4xx: int = 0
+    status_5xx: int = 0
+    errors: int = 0
+    domains_skipped_budget: int = 0
+
+    def record_status(self, status_code: int) -> None:
+        self.requests += 1
+        if 300 <= status_code < 400:
+            self.status_3xx += 1
+        elif 400 <= status_code < 500:
+            self.status_4xx += 1
+        elif status_code >= 500:
+            self.status_5xx += 1
+
+    def record_error(self) -> None:
+        self.requests += 1
+        self.errors += 1
+
+    def as_log_dict(self) -> dict[str, int]:
+        return {
+            "http_requests": self.requests,
+            "http_3xx": self.status_3xx,
+            "http_4xx": self.status_4xx,
+            "http_5xx": self.status_5xx,
+            "http_errors": self.errors,
+            "domains_skipped_budget": self.domains_skipped_budget,
+        }
+
+
+_last_crawl_stats = HttpStats()
+
+
+def get_last_crawl_http_stats() -> HttpStats:
+    """Return stats from the latest ``crawl_domains`` invocation."""
+    return _last_crawl_stats
+
+
+def reset_crawl_http_stats() -> HttpStats:
+    """Reset and return a fresh stats object (used at crawl start)."""
+    global _last_crawl_stats
+    _last_crawl_stats = HttpStats()
+    return _last_crawl_stats
+
+
+@dataclass
+class _CrawlBudget:
+    """Shared crawl limits: wall-clock deadline and max HTTP requests."""
+
+    deadline: float | None = None
+    max_requests: int | None = None
+    stats: HttpStats = field(default_factory=HttpStats)
+    max_retries: int = 1
+    _stopped: bool = field(default=False, repr=False)
+
+    def should_stop(self) -> bool:
+        if self._stopped:
+            return True
+        if self.deadline is not None and time.time() >= self.deadline:
+            self._stopped = True
+            return True
+        if self.max_requests is not None and self.stats.requests >= self.max_requests:
+            self._stopped = True
+            return True
+        return False
+
+    def mark_domain_skipped(self) -> None:
+        self.stats.domains_skipped_budget += 1
 
 
 @dataclass(frozen=True)
@@ -265,12 +342,41 @@ async def _request_with_limits(
     client: httpx.AsyncClient,
     limiter: _HostRateLimiter,
     url: str,
-) -> httpx.Response:
+    budget: _CrawlBudget | None = None,
+) -> httpx.Response | None:
+    if budget is not None and budget.should_stop():
+        return None
+
     host = urlparse(url).netloc.lower()
-    return await limiter.run(
-        host,
-        client.get(url, follow_redirects=True),
-    )
+    max_attempts = 1 + (budget.max_retries if budget is not None else 0)
+
+    for attempt in range(max_attempts):
+        if budget is not None and budget.should_stop():
+            return None
+        try:
+            response = await limiter.run(
+                host,
+                client.get(url, follow_redirects=True),
+            )
+        except httpx.RequestError:
+            if budget is not None:
+                budget.stats.record_error()
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            raise
+
+        if budget is not None:
+            budget.stats.record_status(response.status_code)
+
+        if response.status_code in _NO_RETRY_STATUS_CODES:
+            return response
+        if response.status_code >= 500 and attempt + 1 < max_attempts:
+            await asyncio.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
+            continue
+        return response
+
+    return None
 
 
 async def is_allowed_by_robots(
@@ -279,9 +385,12 @@ async def is_allowed_by_robots(
     domain: str,
     user_agent: str,
     target_url: str | None = None,
+    budget: _CrawlBudget | None = None,
 ) -> bool:
     host = _normalize_domain(domain)
     if not host:
+        return False
+    if budget is not None and budget.should_stop():
         return False
 
     schemes = ["https", "http"]
@@ -289,9 +398,11 @@ async def is_allowed_by_robots(
     for scheme in schemes:
         robots_url = f"{scheme}://{host}/robots.txt"
         try:
-            response = await _request_with_limits(client, limiter, robots_url)
+            response = await _request_with_limits(client, limiter, robots_url, budget=budget)
         except httpx.RequestError:
             continue
+        if response is None:
+            return False
         if response.status_code >= 400:
             if response.status_code == 404:
                 return True
@@ -313,17 +424,22 @@ async def _fetch_homepage(
     client: httpx.AsyncClient,
     limiter: _HostRateLimiter,
     domain: str,
+    budget: _CrawlBudget | None = None,
 ) -> tuple[str | None, httpx.Response | None]:
     host = _normalize_domain(domain)
     if not host:
+        return None, None
+    if budget is not None and budget.should_stop():
         return None, None
 
     for scheme in ("https", "http"):
         home_url = f"{scheme}://{host}/"
         try:
-            response = await _request_with_limits(client, limiter, home_url)
+            response = await _request_with_limits(client, limiter, home_url, budget=budget)
         except httpx.RequestError:
             continue
+        if response is None:
+            return None, None
         return home_url, response
     return None, None
 
@@ -335,15 +451,20 @@ async def _crawl_single_domain(
     user_agent: str,
     *,
     max_pages_per_domain: int,
+    budget: _CrawlBudget | None = None,
 ) -> list[PageContent]:
     fetch_ok = 0
     fetch_fail = 0
+
+    if budget is not None and budget.should_stop():
+        return []
 
     allowed = await is_allowed_by_robots(
         client=client,
         limiter=limiter,
         domain=domain,
         user_agent=user_agent,
+        budget=budget,
     )
     if not allowed:
         logger.info(
@@ -352,7 +473,7 @@ async def _crawl_single_domain(
         )
         return []
 
-    home_url, home_response = await _fetch_homepage(client, limiter, domain)
+    home_url, home_response = await _fetch_homepage(client, limiter, domain, budget=budget)
     if not home_url or home_response is None:
         fetch_fail += 1
         logger.info("Crawl %s: fetched=0 failed=%d (home unreachable)", domain, fetch_fail)
@@ -381,6 +502,8 @@ async def _crawl_single_domain(
     selected = _select_extra_page_urls(raw_candidates, max_extra)
 
     for candidate_url, page_type in selected:
+        if budget is not None and budget.should_stop():
+            break
         try:
             allowed_candidate = await is_allowed_by_robots(
                 client=client,
@@ -388,13 +511,16 @@ async def _crawl_single_domain(
                 domain=domain,
                 user_agent=user_agent,
                 target_url=candidate_url,
+                budget=budget,
             )
             if not allowed_candidate:
                 fetch_fail += 1
                 logger.debug("Skipping %s due to robots rule", candidate_url)
                 continue
 
-            response = await _request_with_limits(client, limiter, candidate_url)
+            response = await _request_with_limits(client, limiter, candidate_url, budget=budget)
+            if response is None:
+                break
             pages.append(
                 PageContent(
                     url=str(response.url),
@@ -425,6 +551,10 @@ async def _crawl_domains_async(
     delay_per_host: float,
     *,
     max_pages_per_domain: int,
+    deadline: float | None = None,
+    max_requests: int | None = None,
+    max_retries: int = 1,
+    budget: _CrawlBudget | None = None,
 ) -> dict[str, list[PageContent]]:
     timeout = httpx.Timeout(request_timeout)
     limiter = _HostRateLimiter(
@@ -434,6 +564,17 @@ async def _crawl_domains_async(
     headers = {"User-Agent": user_agent}
     results: dict[str, list[PageContent]] = {}
     semaphore = asyncio.Semaphore(max(1, concurrency))
+    if budget is None:
+        budget = _CrawlBudget(
+            deadline=deadline,
+            max_requests=max_requests,
+            stats=reset_crawl_http_stats(),
+            max_retries=max_retries,
+        )
+    else:
+        budget.deadline = deadline if deadline is not None else budget.deadline
+        budget.max_requests = max_requests if max_requests is not None else budget.max_requests
+        budget.max_retries = max_retries
 
     async with httpx.AsyncClient(
         timeout=timeout,
@@ -441,7 +582,15 @@ async def _crawl_domains_async(
         max_redirects=_CRAWLER_MAX_REDIRECTS,
     ) as client:
         async def run_one(domain: str) -> None:
+            if budget.should_stop():
+                budget.mark_domain_skipped()
+                results[domain] = []
+                return
             async with semaphore:
+                if budget.should_stop():
+                    budget.mark_domain_skipped()
+                    results[domain] = []
+                    return
                 try:
                     results[domain] = await _crawl_single_domain(
                         client=client,
@@ -449,6 +598,7 @@ async def _crawl_domains_async(
                         domain=domain,
                         user_agent=user_agent,
                         max_pages_per_domain=max_pages_per_domain,
+                        budget=budget,
                     )
                 except Exception:
                     logger.exception("Unexpected crawl failure for domain=%s", domain)
@@ -456,16 +606,26 @@ async def _crawl_domains_async(
                     results[domain] = []
 
         await asyncio.gather(*(run_one(domain) for domain in domains))
+
+    global _last_crawl_stats
+    _last_crawl_stats = budget.stats
     return results
 
 
-def crawl_domains(domains: list[str]) -> dict[str, list[PageContent]]:
+def crawl_domains(
+    domains: list[str],
+    *,
+    deadline: float | None = None,
+    max_requests: int | None = None,
+) -> dict[str, list[PageContent]]:
     if not domains:
+        reset_crawl_http_stats()
         return {}
     from .config import get_config
 
     _silence_verbose_http_loggers()
     cfg = get_config()
+    req_cap = max_requests if max_requests is not None else cfg.crawler_max_requests_per_run
     return asyncio.run(
         _crawl_domains_async(
             domains=domains,
@@ -475,6 +635,9 @@ def crawl_domains(domains: list[str]) -> dict[str, list[PageContent]]:
             user_agent=cfg.crawler_user_agent,
             delay_per_host=cfg.crawler_delay_per_host,
             max_pages_per_domain=cfg.crawler_max_pages_per_domain,
+            deadline=deadline,
+            max_requests=req_cap,
+            max_retries=cfg.crawler_max_retries,
         )
     )
 

@@ -50,6 +50,8 @@ DOMAIN_PROGRESS_LOG_EVERY = 25
 # Crawler: cap pages per host (home + extras) and HTTP timeout (seconds).
 CRAWLER_MAX_PAGES_PER_DOMAIN = 4  # home + up to 3 internal links
 CRAWLER_REQUEST_TIMEOUT = 10.0
+CRAWLER_MAX_RETRIES = 1  # extra attempts after the first (403/404/410 are never retried)
+CRAWLER_MAX_REQUESTS_PER_RUN = 20_000
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,8 @@ class AppConfig:
     crawler_request_timeout: float
     crawler_user_agent: str
     crawler_delay_per_host: float
+    crawler_max_retries: int
+    crawler_max_requests_per_run: int
 
 
 def get_config() -> AppConfig:
@@ -121,4 +125,8 @@ def get_config() -> AppConfig:
             "PPP-EnrichmentBot/1.0 (+https://example.com/bot)",
         ),
         crawler_delay_per_host=float(os.getenv("CRAWLER_DELAY_PER_HOST", "0.5")),
+        crawler_max_retries=int(os.getenv("CRAWLER_MAX_RETRIES", str(CRAWLER_MAX_RETRIES))),
+        crawler_max_requests_per_run=int(
+            os.getenv("CRAWLER_MAX_REQUESTS_PER_RUN", str(CRAWLER_MAX_REQUESTS_PER_RUN))
+        ),
     )

@@ -452,11 +452,21 @@ async def _crawl_single_domain(
     *,
     max_pages_per_domain: int,
     budget: _CrawlBudget | None = None,
+    per_domain_time_limit: float | None = None,
 ) -> list[PageContent]:
     fetch_ok = 0
     fetch_fail = 0
+    domain_started = time.monotonic()
+
+    def _domain_time_exceeded() -> bool:
+        if per_domain_time_limit is None:
+            return False
+        return (time.monotonic() - domain_started) >= per_domain_time_limit
 
     if budget is not None and budget.should_stop():
+        return []
+    if _domain_time_exceeded():
+        logger.info("Crawl %s: skipped (per-domain %ss limit)", domain, per_domain_time_limit)
         return []
 
     allowed = await is_allowed_by_robots(
@@ -502,6 +512,9 @@ async def _crawl_single_domain(
     selected = _select_extra_page_urls(raw_candidates, max_extra)
 
     for candidate_url, page_type in selected:
+        if _domain_time_exceeded():
+            logger.info("Crawl %s: stopped extra pages (per-domain time limit)", domain)
+            break
         if budget is not None and budget.should_stop():
             break
         try:
@@ -555,6 +568,7 @@ async def _crawl_domains_async(
     max_requests: int | None = None,
     max_retries: int = 1,
     budget: _CrawlBudget | None = None,
+    per_domain_time_limit: float | None = None,
 ) -> dict[str, list[PageContent]]:
     timeout = httpx.Timeout(request_timeout)
     limiter = _HostRateLimiter(
@@ -599,6 +613,7 @@ async def _crawl_domains_async(
                         user_agent=user_agent,
                         max_pages_per_domain=max_pages_per_domain,
                         budget=budget,
+                        per_domain_time_limit=per_domain_time_limit,
                     )
                 except Exception:
                     logger.exception("Unexpected crawl failure for domain=%s", domain)
@@ -638,6 +653,7 @@ def crawl_domains(
             deadline=deadline,
             max_requests=req_cap,
             max_retries=cfg.crawler_max_retries,
+            per_domain_time_limit=float(cfg.crawler_per_domain_time_limit_seconds),
         )
     )
 
@@ -664,6 +680,7 @@ def crawl_company_pages(domains_df: pd.DataFrame, config: AppConfig) -> pd.DataF
             user_agent=config.crawler_user_agent,
             delay_per_host=config.crawler_delay_per_host,
             max_pages_per_domain=config.crawler_max_pages_per_domain,
+            per_domain_time_limit=float(config.crawler_per_domain_time_limit_seconds),
         )
     )
     output["crawled_pages"] = output.get("website_domain", "").map(

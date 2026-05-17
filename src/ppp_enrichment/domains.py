@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import time
+from dataclasses import dataclass
+import logging
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import urlparse
@@ -19,6 +21,28 @@ from .config import (
     AppConfig,
     get_config,
 )
+
+
+@dataclass
+class LeadHttpAudit:
+    """HTTP work attributable to one borrower row during domain resolution."""
+
+    serp_searches: int = 0
+    candidate_score_gets: int = 0
+    candidates_considered: int = 0
+    elapsed_seconds: float = 0.0
+    skipped_time_budget: bool = False
+    backends: str = ""
+
+    def as_log_dict(self) -> dict[str, int | float | str | bool]:
+        return {
+            "serp_searches": self.serp_searches,
+            "candidate_score_gets": self.candidate_score_gets,
+            "candidates_considered": self.candidates_considered,
+            "elapsed_seconds": round(self.elapsed_seconds, 2),
+            "skipped_time_budget": self.skipped_time_budget,
+            "backends": self.backends,
+        }
 from .logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -145,6 +169,13 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 _domain_cache: dict[tuple[str, str, str], tuple[str | None, float]] = {}
+
+
+def _silence_noisy_search_loggers() -> None:
+    """Keep SERP/candidate logs on our logger only."""
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("primp").setLevel(logging.WARNING)
 
 
 def _squeeze_ws(value: str) -> str:
@@ -278,31 +309,52 @@ def _serp_host_is_blocked(host: str) -> bool:
     return False
 
 
-def search_company_domains(company_name: str, city: str | None, state: str | None) -> list[str]:
-    """One DuckDuckGo text search; return non-blacklisted hostnames in SERP order (deduped).
+def search_company_domains(
+    company_name: str,
+    city: str | None,
+    state: str | None,
+    *,
+    backends: str,
+    deadline: float | None = None,
+) -> tuple[list[str], int]:
+    """One DuckDuckGo text search; return hostnames in SERP order and serp call count.
 
-    No HTTP fetches to company sites — only ``ddgs.text`` and URL parsing.
+    Uses only the configured ``backends`` (e.g. ``brave,bing``) — no auto-fallback chain.
+    No httpx GETs to company sites.
     """
     company = _to_text(company_name) or ""
     if not company.strip():
-        return []
+        return [], 0
+    if deadline is not None and time.monotonic() >= deadline:
+        return [], 0
 
     query = _primary_company_search_query(company_name, city, state)
     if not query.strip():
-        return []
+        return [], 0
 
     logger.debug(
-        "DuckDuckGo text query=%r max_results=%d region=%s",
+        "DuckDuckGo text query=%r max_results=%d region=%s backends=%s",
         query,
         DDG_MAX_RESULTS,
         DDG_REGION,
+        backends,
     )
 
     urls_from_hits: list[str] = []
+    serp_calls = 0
+    _silence_noisy_search_loggers()
     try:
         with DDGS() as ddgs:
-            iterator = ddgs.text(query, max_results=DDG_MAX_RESULTS, region=DDG_REGION)
+            serp_calls = 1
+            iterator = ddgs.text(
+                query,
+                max_results=DDG_MAX_RESULTS,
+                region=DDG_REGION,
+                backend=backends,
+            )
             for result in iterator or []:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 if not isinstance(result, dict):
                     continue
                 raw = result.get("href") or result.get("url") or result.get("link")
@@ -310,7 +362,7 @@ def search_company_domains(company_name: str, city: str | None, state: str | Non
                     urls_from_hits.append(str(raw))
     except Exception as exc:
         logger.warning("DuckDuckGo search failed for query %r: %s", query, exc)
-        return []
+        return [], serp_calls
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -322,7 +374,7 @@ def search_company_domains(company_name: str, city: str | None, state: str | Non
             continue
         seen.add(domain)
         ordered.append(domain)
-    return ordered
+    return ordered, serp_calls
 
 
 class _RateLimiter:
@@ -452,17 +504,27 @@ def _score_domain_sync(
     city: str | None,
     state: str | None,
     zip_code: str | None = None,
+    *,
+    deadline: float | None = None,
+    audit: LeadHttpAudit | None = None,
 ) -> float:
     tokens = _normalized_company_tokens(company_name)
     if not tokens:
         return 0.0
+    if deadline is not None and time.monotonic() >= deadline:
+        return 0.0
 
     html: str | None = None
-    for scheme in ("https", "http"):
+    schemes = ("https", "http")
+    for scheme in schemes:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         url = f"{scheme}://{candidate_domain}/"
         limiter.wait_turn()
         try:
             response = client.get(url, follow_redirects=True, timeout=page_timeout_seconds)
+            if audit is not None:
+                audit.candidate_score_gets += 1
             if response.status_code >= 400:
                 continue
             html = response.text[:500_000]
@@ -523,13 +585,16 @@ def resolve_domain_for_row(
     *,
     client: httpx.Client | None = None,
     config: AppConfig | None = None,
-) -> tuple[str | None, float]:
-    """Resolve a single borrower row to a fast SERP-first domain guess (cached).
+) -> tuple[str | None, float, LeadHttpAudit]:
+    """Resolve one borrower row: 1 SERP search (brave+bing only) + capped homepage GETs.
 
-    One DuckDuckGo search per cache miss; no httpx GETs to score candidates here.
-    ``client`` / ``config`` are accepted for backward-compatible call sites.
+  Per-lead wall clock is capped by ``domain_lead_time_limit_seconds`` (default 15s).
+  Each homepage GET uses ``page_timeout_seconds`` (default 5s).
     """
-    _ = (client, config or get_config())
+    cfg = config or get_config()
+    lead_start = time.monotonic()
+    deadline = lead_start + cfg.domain_lead_time_limit_seconds
+    audit = LeadHttpAudit(backends=cfg.ddg_backends)
 
     company_name = _to_text(row.get("company_name")) or ""
     city = _to_text(row.get("city"))
@@ -537,21 +602,45 @@ def resolve_domain_for_row(
     key = _cache_key_parts(company_name, city, state)
     if key in _domain_cache:
         logger.debug("Domain cache hit for %s / %s / %s", key[0], key[1], key[2])
-        return _domain_cache[key]
+        cached = _domain_cache[key]
+        audit.elapsed_seconds = time.monotonic() - lead_start
+        return cached[0], cached[1], audit
 
     query = _primary_company_search_query(company_name, city, state)
-    candidates = search_company_domains(company_name, city, state)
+    candidates, serp_calls = search_company_domains(
+        company_name,
+        city,
+        state,
+        backends=cfg.ddg_backends,
+        deadline=deadline,
+    )
+    audit.serp_searches = serp_calls
+
     website_domain: str | None = None
     domain_score = 0.0
-    if candidates:
-        cfg = config or get_config()
+    score_cap = max(1, cfg.domain_max_candidates_to_score)
+    candidates_to_score = candidates[:score_cap]
+
+    if candidates_to_score and time.monotonic() < deadline:
         limiter = _RateLimiter(cfg.domain_fetch_requests_per_second)
-        with httpx.Client(follow_redirects=True, timeout=cfg.request_timeout_seconds) as local_client:
+        http_client = client
+        owns_client = http_client is None
+        if owns_client:
+            http_client = httpx.Client(
+                follow_redirects=True,
+                timeout=cfg.request_timeout_seconds,
+            )
+        assert http_client is not None
+        try:
             best_domain: str | None = None
             best_score = 0.0
-            for candidate in candidates:
+            for candidate in candidates_to_score:
+                if time.monotonic() >= deadline:
+                    audit.skipped_time_budget = True
+                    break
+                audit.candidates_considered += 1
                 score = _score_domain_sync(
-                    client=local_client,
+                    client=http_client,
                     limiter=limiter,
                     page_timeout_seconds=cfg.page_timeout_seconds,
                     candidate_domain=candidate,
@@ -559,14 +648,24 @@ def resolve_domain_for_row(
                     city=city,
                     state=state,
                     zip_code=_to_text(row.get("zip")),
+                    deadline=deadline,
+                    audit=audit,
                 )
                 if score > best_score:
                     best_score = score
                     best_domain = candidate
+                if best_score >= cfg.domain_min_score_threshold:
+                    break
             if best_domain and best_score >= _STRONG_ALIGNMENT_MIN_SCORE:
                 website_domain = best_domain
                 domain_score = best_score
+        finally:
+            if owns_client:
+                http_client.close()
+    elif candidates and time.monotonic() >= deadline:
+        audit.skipped_time_budget = True
 
+    audit.elapsed_seconds = time.monotonic() - lead_start
     display_company = company_name if company_name else "<unknown>"
     logger.info(
         "Resolved domain for %s: %s from query '%s'",
@@ -574,17 +673,27 @@ def resolve_domain_for_row(
         website_domain or "None",
         query,
     )
+    logger.info(
+        "[LEAD HTTP] %s %s",
+        display_company,
+        audit.as_log_dict(),
+    )
 
     result = (website_domain, domain_score)
     _domain_cache[key] = result
-    return result
+    return website_domain, domain_score, audit
 
 
 def _series_from_namedtuple(nt: Any) -> pd.Series:
     return pd.Series(nt._asdict())
 
 
-def _attach_domains_sync(df: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
+def _attach_domains_sync(
+    df: pd.DataFrame,
+    config: AppConfig,
+    *,
+    deadline: float | None = None,
+) -> pd.DataFrame:
     result = df.copy()
     if result.empty:
         result["website_domain"] = pd.Series(dtype="string")
@@ -596,43 +705,92 @@ def _attach_domains_sync(df: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
 
     total = len(result)
     non_null = 0
-    for i, nt in enumerate(result.itertuples(index=True), start=1):
-        row_series = _series_from_namedtuple(nt)
-        idx = row_series["Index"]
-        company = _to_text(row_series.get("company_name")) or "<unknown>"
-        try:
-            best_domain, best_score = resolve_domain_for_row(
-                row_series,
-                config=config,
-            )
-        except Exception as exc:
-            logger.warning("Domain resolution failed for '%s': %s", company, exc)
-            best_domain, best_score = None, 0.0
+    total_serp = 0
+    total_score_gets = 0
+    leads_skipped_time = 0
 
-        result.at[idx, "website_domain"] = best_domain
-        result.at[idx, "domain_score"] = float(best_score)
-        if best_domain:
-            non_null += 1
+    _silence_noisy_search_loggers()
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=config.request_timeout_seconds,
+    ) as shared_client:
+        for i, nt in enumerate(result.itertuples(index=True), start=1):
+            if deadline is not None and time.time() >= deadline:
+                logger.warning(
+                    "[TIME BUDGET] Domain phase limit reached at row %d/%d; "
+                    "remaining borrowers keep null website_domain.",
+                    i - 1,
+                    total,
+                )
+                print(
+                    f"[TIME BUDGET] Domain phase limit reached at row {i - 1}/{total}."
+                )
+                break
 
-        if i % DOMAIN_PROGRESS_LOG_EVERY == 0 or i == total:
-            logger.info(
-                "Domain resolution progress: %d/%d rows processed; %d with non-null website_domain",
-                i,
-                total,
-                non_null,
-            )
+            row_series = _series_from_namedtuple(nt)
+            idx = row_series["Index"]
+            company = _to_text(row_series.get("company_name")) or "<unknown>"
+            try:
+                best_domain, best_score, audit = resolve_domain_for_row(
+                    row_series,
+                    client=shared_client,
+                    config=config,
+                )
+            except Exception as exc:
+                logger.warning("Domain resolution failed for '%s': %s", company, exc)
+                best_domain, best_score = None, 0.0
+                audit = LeadHttpAudit()
+
+            total_serp += audit.serp_searches
+            total_score_gets += audit.candidate_score_gets
+            if audit.skipped_time_budget:
+                leads_skipped_time += 1
+
+            result.at[idx, "website_domain"] = best_domain
+            result.at[idx, "domain_score"] = float(best_score)
+            if best_domain:
+                non_null += 1
+
+            if i % DOMAIN_PROGRESS_LOG_EVERY == 0 or i == total:
+                logger.info(
+                    "Domain resolution progress: %d/%d rows processed; %d with non-null website_domain",
+                    i,
+                    total,
+                    non_null,
+                )
+
+    logger.info(
+        "[STATS] domain_phase serp_searches=%d candidate_score_gets=%d "
+        "leads_skipped_time=%d backends=%s",
+        total_serp,
+        total_score_gets,
+        leads_skipped_time,
+        config.ddg_backends,
+    )
+    print(
+        f"[STATS] domain_phase serp_searches={total_serp} "
+        f"candidate_score_gets={total_score_gets} "
+        f"leads_skipped_time={leads_skipped_time} backends={config.ddg_backends}"
+    )
 
     return result
 
 
-def attach_domains_to_borrowers(df: pd.DataFrame) -> pd.DataFrame:
+def attach_domains_to_borrowers(
+    df: pd.DataFrame,
+    *,
+    deadline: float | None = None,
+) -> pd.DataFrame:
     """Resolve and attach ``website_domain`` and ``domain_score`` columns."""
-    config = get_config()
+    cfg = get_config()
     logger.info("Resolving domains for %d borrowers", len(df))
-    return _attach_domains_sync(df=df, config=config)
+    return _attach_domains_sync(df=df, config=cfg, deadline=deadline)
 
 
 def resolve_domains(borrowers_df: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
     """Backward-compatible entrypoint used by pipeline."""
-    logger.info("resolve_domains called: Using DuckDuckGo search (no API key)")
-    return _attach_domains_sync(df=borrowers_df, config=config)
+    logger.info(
+        "resolve_domains called: DuckDuckGo backends=%s (no API key)",
+        config.ddg_backends,
+    )
+    return _attach_domains_sync(df=borrowers_df, config=config, deadline=None)

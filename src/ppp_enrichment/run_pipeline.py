@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import shutil
 import sys
@@ -35,19 +36,29 @@ _ENRICHED_ESSENTIAL_INTERNALS = frozenset({"company_name", "website_domain"})
 MAX_BORROWERS_PER_RUN = 2000
 
 # Phase time budgets (seconds). GitHub-hosted jobs hard-stop at 6h; we exit before that.
-CRAWL_PHASE_LIMIT = 4 * 60 * 60
+DOMAIN_PHASE_LIMIT = 3 * 60 * 60   # cap SERP+scoring so crawl/clean fit in the 6h job
+CRAWL_PHASE_LIMIT = 4 * 60 * 60    # starts after domain resolution, not at job start
 CLEAN_PHASE_LIMIT = 2 * 60 * 60
 TOTAL_LIMIT = 6 * 60 * 60
 
 RUN_START: float = 0.0
+CRAWL_PHASE_START: float = 0.0
 
 
 def _elapsed() -> float:
     return time.time() - RUN_START
 
 
+def _crawl_elapsed() -> float:
+    return time.time() - CRAWL_PHASE_START
+
+
+def _domain_deadline() -> float:
+    return RUN_START + min(DOMAIN_PHASE_LIMIT, TOTAL_LIMIT)
+
+
 def _crawl_deadline() -> float:
-    return RUN_START + min(CRAWL_PHASE_LIMIT, TOTAL_LIMIT)
+    return min(CRAWL_PHASE_START + CRAWL_PHASE_LIMIT, RUN_START + TOTAL_LIMIT)
 
 
 def _total_deadline() -> float:
@@ -55,7 +66,7 @@ def _total_deadline() -> float:
 
 
 def _clean_deadline() -> float:
-    return RUN_START + min(CRAWL_PHASE_LIMIT + CLEAN_PHASE_LIMIT, TOTAL_LIMIT)
+    return RUN_START + TOTAL_LIMIT
 
 
 def _log_phase_timing(phase: str, started_at: float, logger: logging.Logger) -> float:
@@ -65,8 +76,8 @@ def _log_phase_timing(phase: str, started_at: float, logger: logging.Logger) -> 
     return seconds
 
 
-def _check_time_budget(logger: logging.Logger) -> str | None:
-    """Return a stop reason when a budget is exhausted, else None."""
+def _check_total_budget(logger: logging.Logger) -> str | None:
+    """Return ``total`` when the 6h job limit is hit."""
     elapsed = _elapsed()
     if elapsed >= TOTAL_LIMIT:
         logger.warning(
@@ -74,11 +85,25 @@ def _check_time_budget(logger: logging.Logger) -> str | None:
         )
         print("[TIME BUDGET] Total 6h limit reached. Stopping immediately.")
         return "total"
-    if elapsed >= CRAWL_PHASE_LIMIT:
+    return None
+
+
+def _check_crawl_budget(logger: logging.Logger) -> str | None:
+    """Return a crawl-stop reason; crawl clock starts after domain resolution."""
+    total_stop = _check_total_budget(logger)
+    if total_stop is not None:
+        return total_stop
+    crawl_elapsed = _crawl_elapsed()
+    if crawl_elapsed >= CRAWL_PHASE_LIMIT:
         logger.warning(
-            "[TIME BUDGET] 4h crawl limit reached (elapsed=%.0fs).", elapsed
+            "[TIME BUDGET] 4h crawl limit reached (crawl_elapsed=%.0fs, job_elapsed=%.0fs).",
+            crawl_elapsed,
+            _elapsed(),
         )
-        print("[TIME BUDGET] 4h crawl limit reached. No more crawling; moving to clean phase.")
+        print(
+            "[TIME BUDGET] 4h crawl limit reached. Skipping further HTTP crawl; "
+            "still merging borrower rows for clean export."
+        )
         return "crawl"
     return None
 
@@ -165,10 +190,14 @@ def _run_enrichment(
     domain_keys_series = sample_df["website_domain"].map(_cell_to_domain)
     domain_list = domain_keys_series.loc[domain_keys_series.ne("")].drop_duplicates().tolist()
 
-    stop_reason = _check_time_budget(logger)
+    stop_reason = _check_crawl_budget(logger)
     crawl_map: dict[str, list] = {}
     if stop_reason is None:
-        logger.info("Crawling %d unique domains (deadline in %.0fs)", len(domain_list), _crawl_deadline() - time.time())
+        logger.info(
+            "Crawling %d unique domains (crawl deadline in %.0fs)",
+            len(domain_list),
+            max(0.0, _crawl_deadline() - time.time()),
+        )
         crawl_started = time.perf_counter()
         crawl_map = crawler.crawl_domains(
             domain_list,
@@ -177,7 +206,7 @@ def _run_enrichment(
         )
         _log_phase_timing("HTTP crawl", crawl_started, logger)
         _log_http_stats(logger)
-        stop_reason = _check_time_budget(logger)
+        stop_reason = _check_crawl_budget(logger)
 
     extract_started = time.perf_counter()
     domain_contacts: dict[str, extract.ContactInfo] = {}
@@ -187,9 +216,9 @@ def _run_enrichment(
     enriched_rows: list[dict] = []
     processed = 0
     for _, row in sample_df.iterrows():
-        budget_stop = _check_time_budget(logger)
-        if budget_stop is not None:
-            stop_reason = budget_stop
+        # Only the 6h total limit stops row merge; crawl limit skips HTTP only.
+        if _check_total_budget(logger):
+            stop_reason = "total"
             break
 
         row_dict = row.to_dict()
@@ -444,13 +473,19 @@ def main(argv: list[str] | None = None) -> None:
     try:
         logger.info(
             "Pipeline start: target_leads=%d oversample=%s run_dir=%s "
-            "budgets(crawl=%ds clean=%ds total=%ds)",
+            "budgets(domain=%ds crawl=%ds clean=%ds total=%ds) "
+            "http(request=%ss lead_domain=%ss crawl_per_domain=%ss ddg_backends=%s)",
             leads,
             oversample,
             run_dir,
+            DOMAIN_PHASE_LIMIT,
             CRAWL_PHASE_LIMIT,
             CLEAN_PHASE_LIMIT,
             TOTAL_LIMIT,
+            app_cfg.request_timeout_seconds,
+            app_cfg.domain_lead_time_limit_seconds,
+            app_cfg.crawler_per_domain_time_limit_seconds,
+            app_cfg.ddg_backends,
         )
 
         if not ppp_csv_path.exists():
@@ -489,15 +524,25 @@ def main(argv: list[str] | None = None) -> None:
             target_borrowers,
         )
 
-        if _check_time_budget(logger):
+        if _check_total_budget(logger):
             crawl_stop_reason = "total"
 
         domains_started = time.perf_counter()
-        with_domains = domains.attach_domains_to_borrowers(borrower_sample.copy())
+        with_domains = domains.attach_domains_to_borrowers(
+            borrower_sample.copy(),
+            deadline=_domain_deadline(),
+        )
         _log_phase_timing("Domain resolution", domains_started, logger)
 
         wd = with_domains["website_domain"]
         rows_with_domain = int(wd.notna().sum())
+
+        global CRAWL_PHASE_START
+        CRAWL_PHASE_START = time.time()
+        logger.info(
+            "Crawl phase clock started (domain phase used %.0fs of job).",
+            CRAWL_PHASE_START - RUN_START,
+        )
 
         max_http_requests = min(
             app_cfg.crawler_max_requests_per_run,
@@ -521,10 +566,15 @@ def main(argv: list[str] | None = None) -> None:
 
         if enriched is None or len(enriched) == 0:
             print("[CLEAN] No enriched rows this run; skipping clean_leads export.")
-            logger.warning("[CLEAN] No enriched rows; exiting without chunk or output changes.")
+            logger.warning("[CLEAN] No enriched rows; updating chunk only.")
+            remaining_n, chunk_status = _update_chunk_file(
+                ppp_csv_path, raw_sample, full_df, processed, target_borrowers
+            )
             print(f"Target leads: {leads}")
             print(f"Target borrower rows: {target_borrowers}")
             print(f"Actual leads processed: {processed}")
+            print(f"Remaining in chunk: {remaining_n}")
+            print(f"Chunk status: {chunk_status}")
             print("=== RUN COMPLETE (no enrichment) ===")
             sys.exit(0)
 
@@ -555,12 +605,33 @@ def main(argv: list[str] | None = None) -> None:
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         utc_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
         clean_path = config.OUTPUT_DIR / f"clean_leads_{utc_stamp}.csv"
+        output_dir_cwd = os.path.abspath("data/output/")
+        output_dir_config = os.path.abspath(str(config.OUTPUT_DIR))
+        print(f"[DEBUG] Before CSV write — cwd output dir: {output_dir_cwd}")
+        print(f"[DEBUG] Before CSV write — config OUTPUT_DIR: {output_dir_config}")
+        print(f"[DEBUG] Before CSV write — target file: {os.path.abspath(str(clean_path))}")
+        print(
+            f"[DEBUG] Before CSV write — clean_count={clean_count} len(clean_df)={len(clean_df)}"
+        )
+        try:
+            files_before = os.listdir("data/output/")
+        except OSError as exc:
+            files_before = [f"<listdir failed: {exc}>"]
+        print(f"[DEBUG] Before CSV write — files in data/output/: {files_before}")
+
         if len(clean_df) > 0 or clean_count > 0:
             clean_df.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
             logger.info("Clean export: %s rows -> %s", clean_count, clean_path)
         else:
             logger.warning("Clean export produced 0 rows; no CSV written.")
             clean_path = None
+
+        try:
+            files_after = os.listdir("data/output/")
+        except OSError as exc:
+            files_after = [f"<listdir failed: {exc}>"]
+        print(f"[DEBUG] After CSV write — files in data/output/: {files_after}")
+        print(f"[DEBUG] After CSV write — clean_path={clean_path!r} exists={clean_path.exists() if clean_path else False}")
 
         remaining_n, chunk_status = _update_chunk_file(
             ppp_csv_path, raw_sample, full_df, processed, target_borrowers

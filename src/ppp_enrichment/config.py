@@ -40,16 +40,23 @@ GITHUB_CLEAN_RESULTS_DIR = BASE_DIR / "clean_github_results"
 CSV_WRITE_ENCODING = "utf-8-sig"
 
 # DuckDuckGo (domains stage): free search, no API key.
-DDG_MAX_RESULTS = 10
+DDG_MAX_RESULTS = 5
 DDG_REGION = "us-en"
-DDG_DELAY_BETWEEN_QUERIES = 1.0
+# Comma-separated ddgs backends — only the two fastest (avoids wikipedia/yandex/mojeek fallbacks).
+DDG_BACKENDS = "brave,bing"
+DOMAIN_LEAD_TIME_LIMIT_SECONDS = 15
+DOMAIN_MAX_CANDIDATES_TO_SCORE = 5
 
 # Resolver progress logs (borrowers processed between messages).
 DOMAIN_PROGRESS_LOG_EVERY = 25
 
-# Crawler: cap pages per host (home + extras) and HTTP timeout (seconds).
+# HTTP timeouts (seconds) — shared by domain scoring and site crawler.
+HTTP_REQUEST_TIMEOUT_SECONDS = 5
+
+# Crawler: cap pages per host (home + extras) and per-domain wall clock.
 CRAWLER_MAX_PAGES_PER_DOMAIN = 4  # home + up to 3 internal links
-CRAWLER_REQUEST_TIMEOUT = 10.0
+CRAWLER_REQUEST_TIMEOUT = HTTP_REQUEST_TIMEOUT_SECONDS
+CRAWLER_PER_DOMAIN_TIME_LIMIT_SECONDS = 15
 CRAWLER_MAX_RETRIES = 1  # extra attempts after the first (403/404/410 are never retried)
 CRAWLER_MAX_REQUESTS_PER_RUN = 20_000
 
@@ -69,6 +76,9 @@ class AppConfig:
     borrowers_base_output_filename: str
     domain_fetch_requests_per_second: float
     page_timeout_seconds: int
+    ddg_backends: str
+    domain_lead_time_limit_seconds: int
+    domain_max_candidates_to_score: int
     domain_min_score_threshold: float
     log_level: str
     max_concurrency: int
@@ -81,6 +91,7 @@ class AppConfig:
     crawler_delay_per_host: float
     crawler_max_retries: int
     crawler_max_requests_per_run: int
+    crawler_per_domain_time_limit_seconds: int
 
 
 def get_config() -> AppConfig:
@@ -105,13 +116,27 @@ def get_config() -> AppConfig:
         default_prac_input_filename=os.getenv("DEFAULT_PRAC_INPUT_FILENAME", "prac_raw.csv"),
         borrowers_base_output_filename=os.getenv("BORROWERS_BASE_OUTPUT_FILENAME", "borrowers_base.csv"),
         domain_fetch_requests_per_second=float(
-            os.getenv("DOMAIN_FETCH_REQUESTS_PER_SECOND", "3.0")
+            os.getenv("DOMAIN_FETCH_REQUESTS_PER_SECOND", "0")
         ),
-        page_timeout_seconds=int(os.getenv("PAGE_TIMEOUT_SECONDS", "10")),
+        page_timeout_seconds=int(
+            os.getenv("PAGE_TIMEOUT_SECONDS", str(HTTP_REQUEST_TIMEOUT_SECONDS))
+        ),
+        ddg_backends=os.getenv("DDG_BACKENDS", DDG_BACKENDS),
+        domain_lead_time_limit_seconds=int(
+            os.getenv("DOMAIN_LEAD_TIME_LIMIT_SECONDS", str(DOMAIN_LEAD_TIME_LIMIT_SECONDS))
+        ),
+        domain_max_candidates_to_score=int(
+            os.getenv(
+                "DOMAIN_MAX_CANDIDATES_TO_SCORE",
+                str(DOMAIN_MAX_CANDIDATES_TO_SCORE),
+            )
+        ),
         domain_min_score_threshold=float(os.getenv("DOMAIN_MIN_SCORE_THRESHOLD", "0.38")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         max_concurrency=int(os.getenv("MAX_CONCURRENCY", "10")),
-        request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
+        request_timeout_seconds=int(
+            os.getenv("REQUEST_TIMEOUT_SECONDS", str(HTTP_REQUEST_TIMEOUT_SECONDS))
+        ),
         crawler_concurrency=int(os.getenv("CRAWLER_CONCURRENCY", "15")),
         crawler_per_host_concurrency=int(os.getenv("CRAWLER_PER_HOST_CONCURRENCY", "2")),
         crawler_max_pages_per_domain=int(
@@ -128,5 +153,11 @@ def get_config() -> AppConfig:
         crawler_max_retries=int(os.getenv("CRAWLER_MAX_RETRIES", str(CRAWLER_MAX_RETRIES))),
         crawler_max_requests_per_run=int(
             os.getenv("CRAWLER_MAX_REQUESTS_PER_RUN", str(CRAWLER_MAX_REQUESTS_PER_RUN))
+        ),
+        crawler_per_domain_time_limit_seconds=int(
+            os.getenv(
+                "CRAWLER_PER_DOMAIN_TIME_LIMIT_SECONDS",
+                str(CRAWLER_PER_DOMAIN_TIME_LIMIT_SECONDS),
+            )
         ),
     )

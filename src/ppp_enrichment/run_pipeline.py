@@ -211,7 +211,10 @@ def _run_enrichment(
     extract_started = time.perf_counter()
     domain_contacts: dict[str, extract.ContactInfo] = {}
     for domain_key, pages in crawl_map.items():
-        domain_contacts[domain_key] = extract.extract_contact_info(pages)
+        domain_contacts[domain_key] = extract.extract_contact_info(
+            pages,
+            accepted_domain=domain_key,
+        )
 
     enriched_rows: list[dict] = []
     processed = 0
@@ -223,9 +226,13 @@ def _run_enrichment(
 
         row_dict = row.to_dict()
         dk = domain_keys_series[row.name]
-        contact_info = domain_contacts.get(dk) if dk else extract.extract_contact_info([])
+        contact_info = (
+            domain_contacts.get(dk)
+            if dk
+            else extract.extract_contact_info([], accepted_domain=None)
+        )
         if contact_info is None:
-            contact_info = extract.extract_contact_info([])
+            contact_info = extract.extract_contact_info([], accepted_domain=None)
 
         company_name = row_dict.get("company_name") or ""
         if isinstance(company_name, float):
@@ -238,6 +245,7 @@ def _run_enrichment(
             rules.choose_best_contact(
                 company_name=company_name,
                 contact_info=contact_info,
+                accepted_domain=dk or None,
             )
         )
         enriched_rows.append(merged)

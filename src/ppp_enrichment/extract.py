@@ -109,8 +109,33 @@ class ContactInfo:
     all_phones: list[str] = field(default_factory=list)
 
 
-def extract_emails(html: str, domain: str | None = None) -> list[str]:
-    """Extract unique emails from HTML (mailto + plain regex). Optionally prefer company domain."""
+def _url_on_accepted_domain(url: str, accepted_domain: str) -> bool:
+    """True when ``url`` is on ``accepted_domain`` (exact host or subdomain)."""
+    page_host = _normalize_host(urlparse(url).netloc)
+    accepted = _normalize_host(accepted_domain)
+    if not page_host or not accepted:
+        return False
+    return page_host == accepted or page_host.endswith("." + accepted)
+
+
+def _email_on_domain(email: str, accepted_domain: str) -> bool:
+    if "@" not in email:
+        return False
+    email_host = _normalize_host(email.rsplit("@", 1)[1])
+    accepted = _normalize_host(accepted_domain)
+    return bool(email_host and accepted and email_host == accepted)
+
+
+def extract_emails(
+    html: str,
+    domain: str | None = None,
+    *,
+    same_domain_only: bool = False,
+) -> list[str]:
+    """Extract unique emails from HTML (mailto + plain regex).
+
+    When ``same_domain_only`` is True, return only addresses on ``domain`` (RULE 2).
+    """
     raw = html or ""
     seen: set[str] = set()
     ordered: list[str] = []
@@ -148,6 +173,8 @@ def extract_emails(html: str, domain: str | None = None) -> list[str]:
         return ordered
 
     domain_hits = [e for e in ordered if _normalize_host(e.rsplit("@", 1)[-1]) == dom]
+    if same_domain_only:
+        return domain_hits
     rest = [e for e in ordered if e not in domain_hits]
     return domain_hits + rest
 
@@ -239,7 +266,12 @@ def _score_candidate(
     return score
 
 
-def _extract_candidates_from_page(page: PageContent, company_domain: str) -> list[PersonCandidate]:
+def _extract_candidates_from_page(
+    page: PageContent,
+    company_domain: str,
+    *,
+    same_domain_only: bool,
+) -> list[PersonCandidate]:
     soup = BeautifulSoup(page.html or "", "lxml")
     candidates: list[PersonCandidate] = []
     seen: set[tuple[str, str | None, str | None, str | None]] = set()
@@ -253,7 +285,11 @@ def _extract_candidates_from_page(page: PageContent, company_domain: str) -> lis
         if not name:
             continue
         block_html = str(block)
-        emails_list = extract_emails(block_html, domain=company_domain or None)
+        emails_list = extract_emails(
+            block_html,
+            domain=company_domain or None,
+            same_domain_only=same_domain_only,
+        )
         phones_list = extract_phones(block_html)
         phones_iter = phones_list or [None]
         if emails_list:
@@ -310,7 +346,11 @@ def _extract_candidates_from_page(page: PageContent, company_domain: str) -> lis
     if not candidates:
         name, role = _extract_name_and_role(page_text)
         if name:
-            emails_list = extract_emails(page.html or "", domain=company_domain or None)
+            emails_list = extract_emails(
+                page.html or "",
+                domain=company_domain or None,
+                same_domain_only=same_domain_only,
+            )
             phones_list = extract_phones(page.html or "")
             if emails_list:
                 for em in emails_list:
@@ -355,8 +395,15 @@ def _extract_candidates_from_page(page: PageContent, company_domain: str) -> lis
     return candidates
 
 
-def extract_contact_info(pages: list[PageContent]) -> ContactInfo:
-    """Gather structured person candidates plus domain-wide email/phone fallback lists."""
+def extract_contact_info(
+    pages: list[PageContent],
+    accepted_domain: str | None = None,
+) -> ContactInfo:
+    """Gather structured person candidates plus domain-wide email/phone fallback lists.
+
+    When ``accepted_domain`` is set, only pages on that host are used (RULE 2/3) and
+    emails must use that domain — not redirect/CDN/third-party hosts.
+    """
     if not pages:
         return ContactInfo(
             owner_first_name=None,
@@ -370,8 +417,12 @@ def extract_contact_info(pages: list[PageContent]) -> ContactInfo:
             all_phones=[],
         )
 
+    accepted = _normalize_host(accepted_domain or "")
     sorted_pages = sorted(pages, key=_page_sort_key)
-    company_domain = _company_domain_from_pages(sorted_pages)
+    if accepted:
+        sorted_pages = [p for p in sorted_pages if _url_on_accepted_domain(p.url, accepted)]
+    company_domain = accepted or _company_domain_from_pages(sorted_pages)
+    same_domain_only = bool(accepted)
 
     all_candidates: list[PersonCandidate] = []
     data_sources: list[str] = []
@@ -384,9 +435,19 @@ def extract_contact_info(pages: list[PageContent]) -> ContactInfo:
             seen_urls.add(page.url)
             data_sources.append(page.url)
 
-        candidates = _extract_candidates_from_page(page, company_domain=company_domain)
+        candidates = _extract_candidates_from_page(
+            page,
+            company_domain=company_domain,
+            same_domain_only=same_domain_only,
+        )
         all_candidates.extend(candidates)
-        pooled_emails.extend(extract_emails(page.html or "", domain=company_domain or None))
+        pooled_emails.extend(
+            extract_emails(
+                page.html or "",
+                domain=company_domain or None,
+                same_domain_only=same_domain_only,
+            )
+        )
         pooled_phones.extend(extract_phones(page.html or ""))
 
     all_candidates.sort(key=lambda candidate: candidate.score, reverse=True)

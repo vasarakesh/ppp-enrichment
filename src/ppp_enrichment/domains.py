@@ -114,6 +114,27 @@ _SERP_DOMAIN_BLOCKLIST: frozenset[str] = frozenset(
 _MIN_TOKEN_LEN = 3
 _STRONG_ALIGNMENT_MIN_SCORE = 0.34
 
+# Ignored when checking company-name ↔ domain-label overlap (RULE 1).
+_DOMAIN_MATCH_GENERIC_TOKENS: frozenset[str] = frozenset(
+    {
+        "llc",
+        "inc",
+        "corp",
+        "ltd",
+        "the",
+        "of",
+        "and",
+        "group",
+        "services",
+        "solutions",
+        "associates",
+        "consulting",
+        "company",
+        "enterprises",
+        "management",
+    }
+)
+
 # Legal / entity suffix tokens removed from the end (and internal "noise") for querying & matching.
 _COMPANY_SUFFIX_PATTERN = re.compile(
     r"""
@@ -442,6 +463,44 @@ def _name_overlap_score(tokens: list[str], headline_lower: str, page_lower: str)
     return min(1.0, base)
 
 
+def meaningful_company_tokens_for_domain_match(company_name: str) -> list[str]:
+    """Non-generic tokens from normalized company name (RULE 1)."""
+    stripped = _strip_company_suffixes(company_name)
+    return [
+        token
+        for token in stripped.split()
+        if len(token) >= _MIN_TOKEN_LEN and token not in _DOMAIN_MATCH_GENERIC_TOKENS
+    ]
+
+
+def domain_label_for_match(domain: str) -> str:
+    host = (domain or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host.split(".", 1)[0]
+
+
+def domain_accepted_for_company(company_name: str, domain: str) -> bool:
+    """Accept domain only if a meaningful company token appears in the domain label (or reverse)."""
+    if not domain:
+        return False
+    meaningful = meaningful_company_tokens_for_domain_match(company_name)
+    if not meaningful:
+        return False
+
+    label = domain_label_for_match(domain)
+    company_compact = _strip_company_suffixes(company_name).replace(" ", "")
+
+    if any(token in label for token in meaningful):
+        return True
+
+    label_parts = [part for part in re.split(r"[^a-z0-9]+", label) if len(part) >= _MIN_TOKEN_LEN]
+    label_compact = "".join(label_parts)
+    if label_compact and label_compact in company_compact:
+        return True
+    return any(part in company_compact for part in label_parts)
+
+
 def _domain_label_tokens(candidate_domain: str) -> list[str]:
     host = (candidate_domain or "").strip().lower()
     if host.startswith("www."):
@@ -639,6 +698,13 @@ def resolve_domain_for_row(
                     audit.skipped_time_budget = True
                     break
                 audit.candidates_considered += 1
+                if not domain_accepted_for_company(company_name, candidate):
+                    logger.debug(
+                        "Rejecting candidate domain %s for %s: no company token in label",
+                        candidate,
+                        company_name,
+                    )
+                    continue
                 score = _score_domain_sync(
                     client=http_client,
                     limiter=limiter,
@@ -656,7 +722,11 @@ def resolve_domain_for_row(
                     best_domain = candidate
                 if best_score >= cfg.domain_min_score_threshold:
                     break
-            if best_domain and best_score >= _STRONG_ALIGNMENT_MIN_SCORE:
+            if (
+                best_domain
+                and best_score >= _STRONG_ALIGNMENT_MIN_SCORE
+                and domain_accepted_for_company(company_name, best_domain)
+            ):
                 website_domain = best_domain
                 domain_score = best_score
         finally:
@@ -707,6 +777,7 @@ def _attach_domains_sync(
     non_null = 0
     total_serp = 0
     total_score_gets = 0
+    total_candidates_considered = 0
     leads_skipped_time = 0
 
     _silence_noisy_search_loggers()
@@ -743,6 +814,7 @@ def _attach_domains_sync(
 
             total_serp += audit.serp_searches
             total_score_gets += audit.candidate_score_gets
+            total_candidates_considered += audit.candidates_considered
             if audit.skipped_time_budget:
                 leads_skipped_time += 1
 
@@ -760,16 +832,20 @@ def _attach_domains_sync(
                 )
 
     logger.info(
-        "[STATS] domain_phase serp_searches=%d candidate_score_gets=%d "
-        "leads_skipped_time=%d backends=%s",
+        "[STATS] domain_phase serp_searches=%d candidates_considered=%d "
+        "candidate_score_gets=%d domains_resolved=%d leads_skipped_time=%d backends=%s",
         total_serp,
+        total_candidates_considered,
         total_score_gets,
+        non_null,
         leads_skipped_time,
         config.ddg_backends,
     )
     print(
         f"[STATS] domain_phase serp_searches={total_serp} "
+        f"candidates_considered={total_candidates_considered} "
         f"candidate_score_gets={total_score_gets} "
+        f"domains_resolved={non_null} "
         f"leads_skipped_time={leads_skipped_time} backends={config.ddg_backends}"
     )
 

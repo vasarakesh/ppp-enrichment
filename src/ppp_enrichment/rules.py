@@ -184,7 +184,27 @@ def _unique_emails_from_candidates(candidates: list[PersonCandidate]) -> list[st
     return ordered
 
 
-def choose_best_contact(company_name: str, contact_info: ContactInfo | None) -> dict:
+def _phone_from_accepted_domain(
+    phone: str | None,
+    source_url: str | None,
+    company_domain: str,
+) -> bool:
+    """RULE 3: phone must come from a page on the accepted domain."""
+    if not phone or not company_domain:
+        return bool(phone)
+    if not source_url:
+        return False
+    host = _normalize_host(urlparse(source_url).netloc)
+    accepted = _normalize_host(company_domain)
+    return host == accepted or host.endswith("." + accepted)
+
+
+def choose_best_contact(
+    company_name: str,
+    contact_info: ContactInfo | None,
+    *,
+    accepted_domain: str | None = None,
+) -> dict:
     """Pick the outbound contact bundle from structured scrape results."""
     sources = [str(src) for src in _as_list(contact_info.data_sources)] if contact_info else []
 
@@ -217,12 +237,40 @@ def choose_best_contact(company_name: str, contact_info: ContactInfo | None) -> 
         )
         return base
 
-    company_domain = _extract_company_domain_from_sources(contact_info.data_sources)
+    company_domain = _normalize_host(accepted_domain or "") or _extract_company_domain_from_sources(
+        contact_info.data_sources
+    )
     candidates = list(contact_info.candidates or [])
     aggregated_emails = list(contact_info.all_emails or [])
     aggregated_phones = list(contact_info.all_phones or [])
     if not aggregated_emails:
         aggregated_emails = _unique_emails_from_candidates(candidates)
+
+    def _email_on_accepted(email: str | None) -> bool:
+        if not email:
+            return False
+        if not company_domain:
+            return True
+        return _email_domain(email) == company_domain
+
+    candidates = [
+        cand
+        for cand in candidates
+        if (not cand.email or _email_on_accepted(cand.email))
+        and (not cand.phone or _phone_from_accepted_domain(cand.phone, cand.source_url, company_domain))
+    ]
+    aggregated_emails = [email for email in aggregated_emails if _email_on_accepted(email)]
+    if company_domain:
+        phones_from_candidates = [
+            cand.phone
+            for cand in candidates
+            if cand.phone and _phone_from_accepted_domain(cand.phone, cand.source_url, company_domain)
+        ]
+        aggregated_phones = phones_from_candidates or [
+            phone for phone in aggregated_phones if phone
+        ]
+    else:
+        aggregated_phones = list(contact_info.all_phones or [])
 
     ownership_pool = [
         candidate

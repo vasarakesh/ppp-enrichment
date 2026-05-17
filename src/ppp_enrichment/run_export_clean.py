@@ -143,13 +143,23 @@ def _email_tokens(email: object) -> set[str]:
     return tokens
 
 
-def _email_word_matches_website(email: object, website_domain: object) -> bool:
-    """At least one meaningful token from the email appears in the website host tokens."""
-    web_tokens = _host_tokens(website_domain)
-    if not web_tokens:
-        return True
-    mail_tokens = _email_tokens(email)
-    return bool(mail_tokens & web_tokens)
+def _normalize_host(host: object) -> str:
+    normalized = str(host or "").strip().lower()
+    if normalized.startswith("www."):
+        return normalized[4:]
+    return normalized
+
+
+def _email_domain_matches_website(email: object, website_domain: object) -> bool:
+    """Email @-domain must equal accepted website_domain (RULE 4 — not token overlap)."""
+    if pd.isna(email) or pd.isna(website_domain):
+        return False
+    text = str(email).strip().lower()
+    host = _normalize_host(website_domain)
+    if not text or "@" not in text or not host:
+        return False
+    email_host = _normalize_host(text.rsplit("@", 1)[1])
+    return email_host == host
 
 
 def _email_contains_blocked_word(value: object) -> bool:
@@ -167,7 +177,7 @@ def _email_passes_clean_filters(email: object, website_domain: object) -> bool:
         return False
     if _email_contains_blocked_word(email):
         return False
-    if not _email_word_matches_website(email, website_domain):
+    if not _email_domain_matches_website(email, website_domain):
         return False
     return True
 

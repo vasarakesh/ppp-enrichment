@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import config
+from .domains import is_gov_or_edu_domain
 
 
 _CHUNK_SIZE = 500
@@ -172,11 +173,26 @@ def _email_contains_blocked_word(value: object) -> bool:
     return bool(_EMAIL_BLOCKED_WORD_RE.search(lowered))
 
 
+def _website_domain_passes_filters(website_domain: object) -> bool:
+    if pd.isna(website_domain):
+        return False
+    host = str(website_domain).strip()
+    if not host:
+        return False
+    return not is_gov_or_edu_domain(host)
+
+
 def _email_passes_clean_filters(email: object, website_domain: object) -> bool:
     if _is_unusable_email(email):
         return False
     if _email_contains_blocked_word(email):
         return False
+    if not _website_domain_passes_filters(website_domain):
+        return False
+    if not pd.isna(email):
+        text = str(email).strip().lower()
+        if "@" in text and is_gov_or_edu_domain(text.rsplit("@", 1)[1]):
+            return False
     if not _email_domain_matches_website(email, website_domain):
         return False
     return True

@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
+from .domains import is_gov_or_edu_domain
 from .extract import ContactInfo, PersonCandidate
 from .logging_utils import get_logger
 
@@ -240,6 +241,8 @@ def choose_best_contact(
     company_domain = _normalize_host(accepted_domain or "") or _extract_company_domain_from_sources(
         contact_info.data_sources
     )
+    if company_domain and is_gov_or_edu_domain(company_domain):
+        company_domain = ""
     candidates = list(contact_info.candidates or [])
     aggregated_emails = list(contact_info.all_emails or [])
     aggregated_phones = list(contact_info.all_phones or [])

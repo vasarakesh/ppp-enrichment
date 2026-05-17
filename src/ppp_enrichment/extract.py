@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 
 from .crawler import PageContent
+from .domains import is_gov_or_edu_domain
 from .logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -172,7 +173,11 @@ def extract_emails(
     if not dom:
         return ordered
 
-    domain_hits = [e for e in ordered if _normalize_host(e.rsplit("@", 1)[-1]) == dom]
+    domain_hits = [
+        e
+        for e in ordered
+        if _normalize_host(e.rsplit("@", 1)[-1]) == dom and not is_gov_or_edu_domain(e)
+    ]
     if same_domain_only:
         return domain_hits
     rest = [e for e in ordered if e not in domain_hits]
@@ -418,6 +423,8 @@ def extract_contact_info(
         )
 
     accepted = _normalize_host(accepted_domain or "")
+    if accepted and is_gov_or_edu_domain(accepted):
+        accepted = ""
     sorted_pages = sorted(pages, key=_page_sort_key)
     if accepted:
         sorted_pages = [p for p in sorted_pages if _url_on_accepted_domain(p.url, accepted)]

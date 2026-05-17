@@ -23,6 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import crawler, domains, extract, ingest, rules
+from .domains import is_gov_or_edu_domain
 from . import config
 from . import run_export_clean
 from .config import get_config
@@ -188,7 +189,11 @@ def _run_enrichment(
         raise ValueError("Borrowers sample with domains is empty.")
 
     domain_keys_series = sample_df["website_domain"].map(_cell_to_domain)
-    domain_list = domain_keys_series.loc[domain_keys_series.ne("")].drop_duplicates().tolist()
+    domain_list = [
+        d
+        for d in domain_keys_series.loc[domain_keys_series.ne("")].drop_duplicates().tolist()
+        if not is_gov_or_edu_domain(d)
+    ]
 
     stop_reason = _check_crawl_budget(logger)
     crawl_map: dict[str, list] = {}

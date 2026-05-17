@@ -322,8 +322,31 @@ def _primary_company_search_query(company_name: str, city: str | None, state: st
     return queries[0] if queries else ""
 
 
+_BLOCKED_PUBLIC_TLDS: frozenset[str] = frozenset({"gov", "edu"})
+
+
+def normalize_domain_host(domain: str) -> str:
+    host = (domain or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def is_gov_or_edu_domain(domain: str) -> bool:
+    """True for ``*.gov``, ``*.edu``, and hosts whose registrable TLD is gov/edu."""
+    host = normalize_domain_host(domain)
+    if not host:
+        return False
+    if host.endswith(".gov") or host.endswith(".edu"):
+        return True
+    labels = host.split(".")
+    return bool(labels) and labels[-1] in _BLOCKED_PUBLIC_TLDS
+
+
 def _serp_host_is_blocked(host: str) -> bool:
     h = host.lower().strip()
+    if is_gov_or_edu_domain(h):
+        return True
     for root in _SERP_DOMAIN_BLOCKLIST:
         if h == root or h.endswith(f".{root}"):
             return True
@@ -483,6 +506,8 @@ def domain_label_for_match(domain: str) -> str:
 def domain_accepted_for_company(company_name: str, domain: str) -> bool:
     """Accept domain only if a meaningful company token appears in the domain label (or reverse)."""
     if not domain:
+        return False
+    if is_gov_or_edu_domain(domain):
         return False
     meaningful = meaningful_company_tokens_for_domain_match(company_name)
     if not meaningful:
@@ -726,6 +751,7 @@ def resolve_domain_for_row(
                 best_domain
                 and best_score >= _STRONG_ALIGNMENT_MIN_SCORE
                 and domain_accepted_for_company(company_name, best_domain)
+                and not is_gov_or_edu_domain(best_domain)
             ):
                 website_domain = best_domain
                 domain_score = best_score

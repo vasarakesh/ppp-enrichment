@@ -576,6 +576,20 @@ def main(argv: list[str] | None = None) -> None:
             len(enriched),
             processed,
         )
+        has_domain_mask = enriched["website_domain"].notna() & enriched["website_domain"].astype(str).str.strip().ne("")
+        has_email_mask = enriched.get("email", pd.Series(dtype=object)).notna() & enriched["email"].astype(str).str.strip().ne("")
+        has_phone_mask = enriched.get("phone", pd.Series(dtype=object)).notna() & enriched["phone"].astype(str).str.strip().ne("")
+        logger.info(
+            "[STATS] enrichment_funnel domains=%d email=%d phone=%d (of %d rows)",
+            int(has_domain_mask.sum()),
+            int(has_email_mask.sum()),
+            int(has_phone_mask.sum()),
+            len(enriched),
+        )
+        print(
+            f"[STATS] enrichment_funnel domains={int(has_domain_mask.sum())} "
+            f"email={int(has_email_mask.sum())} phone={int(has_phone_mask.sum())}"
+        )
 
         if enriched is None or len(enriched) == 0:
             print("[CLEAN] No enriched rows this run; skipping clean_leads export.")

@@ -15,7 +15,9 @@ import pandas as pd
 from ddgs import DDGS
 
 from .config import (
+    DDG_FALLBACK_BACKENDS,
     DDG_MAX_RESULTS,
+    DDG_PRIMARY_BACKEND,
     DDG_REGION,
     DOMAIN_PROGRESS_LOG_EVERY,
     AppConfig,
@@ -197,6 +199,16 @@ def _silence_noisy_search_loggers() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("primp").setLevel(logging.WARNING)
+    logging.getLogger("ddgs").setLevel(logging.ERROR)
+    logging.getLogger("ddgs.ddgs").setLevel(logging.ERROR)
+
+
+def _normalize_ddg_backend(backend: str) -> str:
+    """Map config names to ddgs package backend ids (``google`` -> ``mullvad_google``)."""
+    name = (backend or "").strip().lower()
+    if name == "google":
+        return "mullvad_google"
+    return name
 
 
 def _squeeze_ws(value: str) -> str:
@@ -353,6 +365,56 @@ def _serp_host_is_blocked(host: str) -> bool:
     return False
 
 
+def _ddg_text_search_urls(
+    query: str,
+    backend: str,
+    deadline: float | None,
+) -> list[str]:
+    """Run one ddgs ``text`` query on a single named backend."""
+    urls_from_hits: list[str] = []
+    _silence_noisy_search_loggers()
+    backend_id = _normalize_ddg_backend(backend)
+    try:
+        with DDGS() as ddgs:
+            iterator = ddgs.text(
+                query,
+                max_results=DDG_MAX_RESULTS,
+                region=DDG_REGION,
+                backend=backend_id,
+            )
+            for result in iterator or []:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if not isinstance(result, dict):
+                    continue
+                raw = result.get("href") or result.get("url") or result.get("link")
+                if raw:
+                    urls_from_hits.append(str(raw))
+    except Exception as exc:
+        logger.warning(
+            "DuckDuckGo search failed for query %r backend=%s (id=%s): %s",
+            query,
+            backend,
+            backend_id,
+            exc,
+        )
+    return urls_from_hits
+
+
+def _ordered_domains_from_urls(urls_from_hits: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for url in urls_from_hits:
+        domain = _normalize_url_to_domain(url)
+        if not domain or domain in seen:
+            continue
+        if _serp_host_is_blocked(domain):
+            continue
+        seen.add(domain)
+        ordered.append(domain)
+    return ordered
+
+
 def search_company_domains(
     company_name: str,
     city: str | None,
@@ -361,11 +423,12 @@ def search_company_domains(
     backends: str,
     deadline: float | None = None,
 ) -> tuple[list[str], int]:
-    """One DuckDuckGo text search; return hostnames in SERP order and serp call count.
+    """One company SERP lookup: ``duckduckgo`` first, ``google`` if zero domains.
 
-    Uses only the configured ``backends`` (e.g. ``brave,bing``) — no auto-fallback chain.
+    ``backends`` is logged for config compatibility (e.g. ``duckduckgo,google``).
     No httpx GETs to company sites.
     """
+    _ = backends
     company = _to_text(company_name) or ""
     if not company.strip():
         return [], 0
@@ -377,47 +440,35 @@ def search_company_domains(
         return [], 0
 
     logger.debug(
-        "DuckDuckGo text query=%r max_results=%d region=%s backends=%s",
+        "DuckDuckGo text query=%r max_results=%d region=%s primary=%s fallbacks=%s",
         query,
         DDG_MAX_RESULTS,
         DDG_REGION,
-        backends,
+        DDG_PRIMARY_BACKEND,
+        DDG_FALLBACK_BACKENDS,
     )
 
-    urls_from_hits: list[str] = []
     serp_calls = 0
-    _silence_noisy_search_loggers()
-    try:
-        with DDGS() as ddgs:
-            serp_calls = 1
-            iterator = ddgs.text(
-                query,
-                max_results=DDG_MAX_RESULTS,
-                region=DDG_REGION,
-                backend=backends,
-            )
-            for result in iterator or []:
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-                if not isinstance(result, dict):
-                    continue
-                raw = result.get("href") or result.get("url") or result.get("link")
-                if raw:
-                    urls_from_hits.append(str(raw))
-    except Exception as exc:
-        logger.warning("DuckDuckGo search failed for query %r: %s", query, exc)
-        return [], serp_calls
-
     ordered: list[str] = []
-    seen: set[str] = set()
-    for url in urls_from_hits:
-        domain = _normalize_url_to_domain(url)
-        if not domain or domain in seen:
-            continue
-        if _serp_host_is_blocked(domain):
-            continue
-        seen.add(domain)
-        ordered.append(domain)
+    backend_chain = (DDG_PRIMARY_BACKEND, *DDG_FALLBACK_BACKENDS)
+    for idx, backend in enumerate(backend_chain):
+        if ordered:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        if idx > 0:
+            logger.info(
+                "SERP backend %s returned 0 domains for %r; trying %s",
+                backend_chain[idx - 1],
+                query,
+                backend,
+            )
+        urls_from_hits = _ddg_text_search_urls(query, backend, deadline)
+        serp_calls += 1
+        ordered = _ordered_domains_from_urls(urls_from_hits)
+        if ordered:
+            logger.debug("SERP hit backend=%s domains=%d query=%r", backend, len(ordered), query)
+
     return ordered, serp_calls
 
 
@@ -670,7 +721,7 @@ def resolve_domain_for_row(
     client: httpx.Client | None = None,
     config: AppConfig | None = None,
 ) -> tuple[str | None, float, LeadHttpAudit]:
-    """Resolve one borrower row: 1 SERP search (brave+bing only) + capped homepage GETs.
+    """Resolve one borrower row: 1 SERP search (duckduckgo, google fallback) + capped homepage GETs.
 
   Per-lead wall clock is capped by ``domain_lead_time_limit_seconds`` (default 15s).
   Each homepage GET uses ``page_timeout_seconds`` (default 5s).

@@ -48,7 +48,10 @@ jobs:
 
       - name: Run pipeline (500 leads)
         if: steps.check_queue.outputs.chunks_available != '0'
-        run: python -m src.ppp_enrichment.run_pipeline --leads 500
+        env:
+          DDG_BACKENDS: duckduckgo,google,yahoo
+          DOMAIN_LEAD_TIME_LIMIT_SECONDS: "20"
+        run: python -m src.ppp_enrichment.run_pipeline --leads 500 --oversample-factor 5
 
       - name: Commit clean output and deleted chunk back to repo
         if: steps.check_queue.outputs.chunks_available != '0'

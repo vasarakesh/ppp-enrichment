@@ -40,10 +40,13 @@ GITHUB_CLEAN_RESULTS_DIR = BASE_DIR / "clean_github_results"
 CSV_WRITE_ENCODING = "utf-8-sig"
 
 # DuckDuckGo (domains stage): free search, no API key.
-DDG_MAX_RESULTS = 5
+DDG_MAX_RESULTS = 10
 DDG_REGION = "us-en"
-# Comma-separated ddgs backends — only the two fastest (avoids wikipedia/yandex/mojeek fallbacks).
-DDG_BACKENDS = "brave,bing"
+# ddgs text backends (primary, then fallbacks in domains.search_company_domains).
+# Config name ``google`` maps to ddgs id ``mullvad_google`` in domains._normalize_ddg_backend.
+DDG_PRIMARY_BACKEND = "duckduckgo"
+DDG_FALLBACK_BACKENDS = ("google", "yahoo")
+DDG_BACKENDS = "duckduckgo,google,yahoo"
 DOMAIN_LEAD_TIME_LIMIT_SECONDS = 15
 DOMAIN_MAX_CANDIDATES_TO_SCORE = 5
 

@@ -25,6 +25,8 @@ data/input/*.xlsx
 data/output/*
 !data/output/.gitkeep
 !data/output/clean_leads_*.csv
+!data/output/Clean Leads 1000/
+!data/output/Clean Leads 1000/**
 
 # Ignore all temp/intermediate files anywhere
 data/output/raw_*.csv

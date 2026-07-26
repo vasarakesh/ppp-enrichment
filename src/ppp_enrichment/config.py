@@ -33,6 +33,9 @@ ENRICHED_SAMPLE_PATH = ENRICHED_DIR / "enriched_borrowers_sample.csv"
 # Clean final leads (narrow columns for outbound use).
 CLEAN_DIR = OUTPUT_DIR / "clean"
 
+# Deduped / prohibited-word-filtered packs of exactly 1000 leads each.
+CLEAN_LEADS_1000_DIR = OUTPUT_DIR / "Clean Leads 1000"
+
 # Clean exports committed from scheduled GitHub jobs (tracked in git; intermediates elsewhere).
 GITHUB_CLEAN_RESULTS_DIR = BASE_DIR / "clean_github_results"
 

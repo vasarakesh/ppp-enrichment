@@ -22,8 +22,6 @@ CLEAN_COLUMNS = [
     "Company Name",
     "Company URL",
 ]
-DEDUPE_COLS = ["Company Name", "Email Address", "Phone Number"]
-
 # Case-insensitive phrase / word denylist checked against all lead text fields.
 _PROHIBITED_PHRASES = (
     "investments",
@@ -127,8 +125,48 @@ def next_pack_id(directory: Path | None = None) -> int:
     return max_id + 1
 
 
+def _email_key(value: object) -> str:
+    return _normalize_text(value).lower()
+
+
+def _phone_key(value: object) -> str:
+    return re.sub(r"\D+", "", _normalize_text(value))
+
+
+def _drop_duplicate_contact_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep first row per non-empty email and per non-empty phone (normalized)."""
+    working = df.copy()
+    working["_email_key"] = working["Email Address"].map(_email_key)
+    working["_phone_key"] = working["Phone Number"].map(_phone_key)
+
+    email_filled = working["_email_key"].ne("")
+
+    # Same email → one row (blank emails are not treated as duplicates of each other).
+    email_deduped = pd.concat(
+        [
+            working.loc[email_filled].drop_duplicates(subset=["_email_key"], keep="first"),
+            working.loc[~email_filled],
+        ],
+        ignore_index=False,
+    ).sort_index()
+
+    # Same phone → one row (blank phones are not treated as duplicates of each other).
+    phone_filled = email_deduped["_phone_key"].ne("")
+    phone_deduped = pd.concat(
+        [
+            email_deduped.loc[phone_filled].drop_duplicates(
+                subset=["_phone_key"], keep="first"
+            ),
+            email_deduped.loc[~phone_filled],
+        ],
+        ignore_index=False,
+    ).sort_index()
+
+    return phone_deduped.drop(columns=["_email_key", "_phone_key"]).reset_index(drop=True)
+
+
 def filter_and_dedupe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Drop prohibited-word rows and duplicates (Company + Email + Phone)."""
+    """Drop prohibited-word rows and duplicates by email or phone number."""
     working = _ensure_clean_columns(df)
     before = len(working)
 
@@ -149,7 +187,7 @@ def filter_and_dedupe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     working = working.loc[~empty_mask].copy()
 
     before_dedupe = len(working)
-    working = working.drop_duplicates(subset=DEDUPE_COLS, keep="first")
+    working = _drop_duplicate_contact_keys(working)
     deduped_n = before_dedupe - len(working)
 
     stats = {
@@ -162,23 +200,34 @@ def filter_and_dedupe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     return working.reset_index(drop=True), stats
 
 
-def _dedupe_key(row: pd.Series) -> tuple[str, str, str]:
-    return (
-        _normalize_text(row.get("Company Name", "")).lower(),
-        _normalize_text(row.get("Email Address", "")).lower(),
-        re.sub(r"\D+", "", _normalize_text(row.get("Phone Number", ""))),
-    )
-
-
 def exclude_already_packaged(
     candidates: pd.DataFrame, packaged: pd.DataFrame
 ) -> pd.DataFrame:
+    """Skip candidates whose email or phone already appears in packaged leads."""
     if packaged.empty or candidates.empty:
         return candidates.reset_index(drop=True)
-    packaged_keys = {_dedupe_key(row) for _, row in packaged.iterrows()}
-    keep_mask = [
-        _dedupe_key(row) not in packaged_keys for _, row in candidates.iterrows()
-    ]
+
+    packaged_emails = {
+        key
+        for key in (_email_key(v) for v in packaged["Email Address"])
+        if key
+    }
+    packaged_phones = {
+        key
+        for key in (_phone_key(v) for v in packaged["Phone Number"])
+        if key
+    }
+
+    def _is_new(row: pd.Series) -> bool:
+        email = _email_key(row.get("Email Address", ""))
+        phone = _phone_key(row.get("Phone Number", ""))
+        if email and email in packaged_emails:
+            return False
+        if phone and phone in packaged_phones:
+            return False
+        return True
+
+    keep_mask = [_is_new(row) for _, row in candidates.iterrows()]
     return candidates.loc[keep_mask].reset_index(drop=True)
 
 

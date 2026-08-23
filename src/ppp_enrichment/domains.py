@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import re
-import time
-from dataclasses import dataclass
 import logging
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import urlparse
@@ -23,6 +25,7 @@ from .config import (
     AppConfig,
     get_config,
 )
+from .logging_utils import get_logger
 
 
 @dataclass
@@ -45,7 +48,7 @@ class LeadHttpAudit:
             "skipped_time_budget": self.skipped_time_budget,
             "backends": self.backends,
         }
-from .logging_utils import get_logger
+
 
 logger = get_logger(__name__)
 
@@ -114,7 +117,9 @@ _SERP_DOMAIN_BLOCKLIST: frozenset[str] = frozenset(
 )
 
 _MIN_TOKEN_LEN = 3
-_STRONG_ALIGNMENT_MIN_SCORE = 0.34
+_STRONG_ALIGNMENT_MIN_SCORE = 0.32
+_domain_cache_lock = threading.Lock()
+_serp_gate = threading.Semaphore(6)
 
 # Ignored when checking company-name ↔ domain-label overlap (RULE 1).
 _DOMAIN_MATCH_GENERIC_TOKENS: frozenset[str] = frozenset(
@@ -365,6 +370,17 @@ def _serp_host_is_blocked(host: str) -> bool:
     return False
 
 
+def email_host_matches_website(email_host: str, website_domain: str) -> bool:
+    """True when email host equals website domain or is a subdomain of it."""
+    host = normalize_domain_host(email_host)
+    accepted = normalize_domain_host(website_domain)
+    if not host or not accepted:
+        return False
+    if is_gov_or_edu_domain(host) or is_gov_or_edu_domain(accepted):
+        return False
+    return host == accepted or host.endswith("." + accepted)
+
+
 def _ddg_text_search_urls(
     query: str,
     backend: str,
@@ -375,21 +391,22 @@ def _ddg_text_search_urls(
     _silence_noisy_search_loggers()
     backend_id = _normalize_ddg_backend(backend)
     try:
-        with DDGS() as ddgs:
-            iterator = ddgs.text(
-                query,
-                max_results=DDG_MAX_RESULTS,
-                region=DDG_REGION,
-                backend=backend_id,
-            )
-            for result in iterator or []:
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-                if not isinstance(result, dict):
-                    continue
-                raw = result.get("href") or result.get("url") or result.get("link")
-                if raw:
-                    urls_from_hits.append(str(raw))
+        with _serp_gate:
+            with DDGS() as ddgs:
+                iterator = ddgs.text(
+                    query,
+                    max_results=DDG_MAX_RESULTS,
+                    region=DDG_REGION,
+                    backend=backend_id,
+                )
+                for result in iterator or []:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    if not isinstance(result, dict):
+                        continue
+                    raw = result.get("href") or result.get("url") or result.get("link")
+                    if raw:
+                        urls_from_hits.append(str(raw))
     except Exception as exc:
         logger.warning(
             "DuckDuckGo search failed for query %r backend=%s (id=%s): %s",
@@ -423,10 +440,11 @@ def search_company_domains(
     backends: str,
     deadline: float | None = None,
 ) -> tuple[list[str], int]:
-    """One company SERP lookup: ``duckduckgo`` first, ``google`` if zero domains.
+    """SERP lookup across query steps and backends until domains are found.
 
-    ``backends`` is logged for config compatibility (e.g. ``duckduckgo,google``).
-    No httpx GETs to company sites.
+    Tries ``name city state`` → ``name state`` → ``name``, and for each query
+    walks ``duckduckgo`` → ``google`` → ``yahoo`` until non-blocked domains appear.
+    ``backends`` is logged for config compatibility.
     """
     _ = backends
     company = _to_text(company_name) or ""
@@ -435,13 +453,13 @@ def search_company_domains(
     if deadline is not None and time.monotonic() >= deadline:
         return [], 0
 
-    query = _primary_company_search_query(company_name, city, state)
-    if not query.strip():
+    queries = _build_domain_queries(company_name, city, state)
+    if not queries:
         return [], 0
 
     logger.debug(
-        "DuckDuckGo text query=%r max_results=%d region=%s primary=%s fallbacks=%s",
-        query,
+        "DuckDuckGo text queries=%s max_results=%d region=%s primary=%s fallbacks=%s",
+        queries,
         DDG_MAX_RESULTS,
         DDG_REGION,
         DDG_PRIMARY_BACKEND,
@@ -451,23 +469,33 @@ def search_company_domains(
     serp_calls = 0
     ordered: list[str] = []
     backend_chain = (DDG_PRIMARY_BACKEND, *DDG_FALLBACK_BACKENDS)
-    for idx, backend in enumerate(backend_chain):
+    for query in queries:
         if ordered:
             break
         if deadline is not None and time.monotonic() >= deadline:
             break
-        if idx > 0:
-            logger.info(
-                "SERP backend %s returned 0 domains for %r; trying %s",
-                backend_chain[idx - 1],
-                query,
-                backend,
-            )
-        urls_from_hits = _ddg_text_search_urls(query, backend, deadline)
-        serp_calls += 1
-        ordered = _ordered_domains_from_urls(urls_from_hits)
-        if ordered:
-            logger.debug("SERP hit backend=%s domains=%d query=%r", backend, len(ordered), query)
+        for idx, backend in enumerate(backend_chain):
+            if ordered:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if idx > 0:
+                logger.debug(
+                    "SERP backend %s returned 0 domains for %r; trying %s",
+                    backend_chain[idx - 1],
+                    query,
+                    backend,
+                )
+            urls_from_hits = _ddg_text_search_urls(query, backend, deadline)
+            serp_calls += 1
+            ordered = _ordered_domains_from_urls(urls_from_hits)
+            if ordered:
+                logger.debug(
+                    "SERP hit backend=%s domains=%d query=%r",
+                    backend,
+                    len(ordered),
+                    query,
+                )
 
     return ordered, serp_calls
 
@@ -555,7 +583,7 @@ def domain_label_for_match(domain: str) -> str:
 
 
 def domain_accepted_for_company(company_name: str, domain: str) -> bool:
-    """Accept domain only if a meaningful company token appears in the domain label (or reverse)."""
+    """Accept domain when a meaningful company token aligns with the domain label."""
     if not domain:
         return False
     if is_gov_or_edu_domain(domain):
@@ -574,7 +602,36 @@ def domain_accepted_for_company(company_name: str, domain: str) -> bool:
     label_compact = "".join(label_parts)
     if label_compact and label_compact in company_compact:
         return True
-    return any(part in company_compact for part in label_parts)
+    if any(part in company_compact for part in label_parts):
+        return True
+    # Fuzzy brand match: "acmeplumbing" ≈ "acme plumbing"
+    if company_compact and label_compact and len(company_compact) >= 5 and len(label_compact) >= 5:
+        if SequenceMatcher(None, company_compact, label_compact).ratio() >= 0.82:
+            return True
+    return False
+
+
+def label_match_confidence(company_name: str, domain: str) -> float:
+    """0–1 confidence that the domain label is the company brand (no HTTP)."""
+    if not domain_accepted_for_company(company_name, domain):
+        return 0.0
+    company_tokens = _brand_tokens(company_name)
+    domain_tokens = _domain_label_tokens(domain)
+    company_compact = _strip_company_suffixes(company_name).replace(" ", "")
+    label = domain_label_for_match(domain)
+    overlap = _token_overlap_ratio(company_tokens, domain_tokens)
+    fuzzy = max(
+        _fuzzy_brand_ratio(company_compact, label),
+        _fuzzy_brand_ratio("".join(company_tokens[:2]), label) if company_tokens else 0.0,
+    )
+    # Exact compact containment is a very strong signal.
+    if company_compact and label and (
+        company_compact == label
+        or company_compact in label
+        or label in company_compact
+    ):
+        return max(0.72, min(1.0, 0.40 * overlap + 0.60 * fuzzy))
+    return min(1.0, 0.45 * overlap + 0.55 * fuzzy)
 
 
 def _domain_label_tokens(candidate_domain: str) -> list[str]:
@@ -721,10 +778,10 @@ def resolve_domain_for_row(
     client: httpx.Client | None = None,
     config: AppConfig | None = None,
 ) -> tuple[str | None, float, LeadHttpAudit]:
-    """Resolve one borrower row: 1 SERP search (duckduckgo, google fallback) + capped homepage GETs.
+    """Resolve one borrower row: SERP search + capped homepage GETs.
 
-  Per-lead wall clock is capped by ``domain_lead_time_limit_seconds`` (default 15s).
-  Each homepage GET uses ``page_timeout_seconds`` (default 5s).
+  Per-lead wall clock is capped by ``domain_lead_time_limit_seconds``.
+  Strong domain-label matches can skip homepage GETs (fast path).
     """
     cfg = config or get_config()
     lead_start = time.monotonic()
@@ -735,9 +792,10 @@ def resolve_domain_for_row(
     city = _to_text(row.get("city"))
     state = _to_text(row.get("state"))
     key = _cache_key_parts(company_name, city, state)
-    if key in _domain_cache:
+    with _domain_cache_lock:
+        cached = _domain_cache.get(key)
+    if cached is not None:
         logger.debug("Domain cache hit for %s / %s / %s", key[0], key[1], key[2])
-        cached = _domain_cache[key]
         audit.elapsed_seconds = time.monotonic() - lead_start
         return cached[0], cached[1], audit
 
@@ -756,7 +814,28 @@ def resolve_domain_for_row(
     score_cap = max(1, cfg.domain_max_candidates_to_score)
     candidates_to_score = candidates[:score_cap]
 
-    if candidates_to_score and time.monotonic() < deadline:
+    # Prefer label-aligned candidates; score others only if needed.
+    label_first = [
+        c for c in candidates_to_score if domain_accepted_for_company(company_name, c)
+    ]
+    other_first = [c for c in candidates_to_score if c not in label_first]
+    ordered_candidates = label_first + other_first
+
+    # Fast path: strong brand↔label match → accept without homepage GET.
+    for candidate in label_first:
+        if time.monotonic() >= deadline:
+            audit.skipped_time_budget = True
+            break
+        confidence = label_match_confidence(company_name, candidate)
+        if confidence >= cfg.domain_label_fast_path_min_score and not is_gov_or_edu_domain(
+            candidate
+        ):
+            audit.candidates_considered += 1
+            website_domain = candidate
+            domain_score = max(confidence, _STRONG_ALIGNMENT_MIN_SCORE)
+            break
+
+    if website_domain is None and ordered_candidates and time.monotonic() < deadline:
         limiter = _RateLimiter(cfg.domain_fetch_requests_per_second)
         http_client = client
         owns_client = http_client is None
@@ -764,23 +843,24 @@ def resolve_domain_for_row(
             http_client = httpx.Client(
                 follow_redirects=True,
                 timeout=cfg.request_timeout_seconds,
+                headers={"User-Agent": cfg.crawler_user_agent},
             )
         assert http_client is not None
         try:
             best_domain: str | None = None
             best_score = 0.0
-            for candidate in candidates_to_score:
+            best_label_ok = False
+            for candidate in ordered_candidates:
                 if time.monotonic() >= deadline:
                     audit.skipped_time_budget = True
                     break
-                audit.candidates_considered += 1
-                if not domain_accepted_for_company(company_name, candidate):
-                    logger.debug(
-                        "Rejecting candidate domain %s for %s: no company token in label",
-                        candidate,
-                        company_name,
-                    )
+                if website_domain is not None:
+                    break
+                label_ok = domain_accepted_for_company(company_name, candidate)
+                # After a solid label-aligned hit, skip weaker non-label candidates.
+                if not label_ok and best_domain and best_label_ok:
                     continue
+                audit.candidates_considered += 1
                 score = _score_domain_sync(
                     client=http_client,
                     limiter=limiter,
@@ -796,14 +876,23 @@ def resolve_domain_for_row(
                 if score > best_score:
                     best_score = score
                     best_domain = candidate
-                if best_score >= cfg.domain_min_score_threshold:
+                    best_label_ok = label_ok
+                stop_threshold = cfg.domain_min_score_threshold
+                if label_ok and best_score >= stop_threshold:
                     break
-            if (
-                best_domain
-                and best_score >= _STRONG_ALIGNMENT_MIN_SCORE
-                and domain_accepted_for_company(company_name, best_domain)
-                and not is_gov_or_edu_domain(best_domain)
-            ):
+                if (
+                    not label_ok
+                    and best_score >= cfg.domain_content_only_min_score
+                    and best_score >= stop_threshold
+                ):
+                    break
+            accept = False
+            if best_domain and not is_gov_or_edu_domain(best_domain):
+                if best_label_ok and best_score >= _STRONG_ALIGNMENT_MIN_SCORE:
+                    accept = True
+                elif best_score >= cfg.domain_content_only_min_score:
+                    accept = True
+            if accept and best_domain:
                 website_domain = best_domain
                 domain_score = best_score
         finally:
@@ -827,7 +916,8 @@ def resolve_domain_for_row(
     )
 
     result = (website_domain, domain_score)
-    _domain_cache[key] = result
+    with _domain_cache_lock:
+        _domain_cache[key] = result
     return website_domain, domain_score, audit
 
 
@@ -858,55 +948,67 @@ def _attach_domains_sync(
     leads_skipped_time = 0
 
     _silence_noisy_search_loggers()
-    with httpx.Client(
-        follow_redirects=True,
-        timeout=config.request_timeout_seconds,
-    ) as shared_client:
-        for i, nt in enumerate(result.itertuples(index=True), start=1):
-            if deadline is not None and time.time() >= deadline:
-                logger.warning(
-                    "[TIME BUDGET] Domain phase limit reached at row %d/%d; "
-                    "remaining borrowers keep null website_domain.",
-                    i - 1,
-                    total,
-                )
-                print(
-                    f"[TIME BUDGET] Domain phase limit reached at row {i - 1}/{total}."
-                )
-                break
+    workers = max(1, min(config.max_concurrency, total))
+    logger.info(
+        "Resolving domains with concurrency=%d for %d borrowers",
+        workers,
+        total,
+    )
 
-            row_series = _series_from_namedtuple(nt)
-            idx = row_series["Index"]
-            company = _to_text(row_series.get("company_name")) or "<unknown>"
-            try:
+    rows: list[tuple[Any, pd.Series]] = []
+    for nt in result.itertuples(index=True):
+        row_series = _series_from_namedtuple(nt)
+        rows.append((row_series["Index"], row_series))
+
+    progress_lock = threading.Lock()
+    processed = 0
+
+    def _resolve_one(item: tuple[Any, pd.Series]) -> tuple[Any, str | None, float, LeadHttpAudit]:
+        idx, row_series = item
+        if deadline is not None and time.time() >= deadline:
+            return idx, None, 0.0, LeadHttpAudit(skipped_time_budget=True)
+        company = _to_text(row_series.get("company_name")) or "<unknown>"
+        try:
+            # Per-worker client — httpx sync client is safer than sharing across threads.
+            with httpx.Client(
+                follow_redirects=True,
+                timeout=config.request_timeout_seconds,
+                headers={"User-Agent": config.crawler_user_agent},
+            ) as worker_client:
                 best_domain, best_score, audit = resolve_domain_for_row(
                     row_series,
-                    client=shared_client,
+                    client=worker_client,
                     config=config,
                 )
-            except Exception as exc:
-                logger.warning("Domain resolution failed for '%s': %s", company, exc)
-                best_domain, best_score = None, 0.0
-                audit = LeadHttpAudit()
+        except Exception as exc:
+            logger.warning("Domain resolution failed for '%s': %s", company, exc)
+            best_domain, best_score = None, 0.0
+            audit = LeadHttpAudit()
+        return idx, best_domain, float(best_score), audit
 
-            total_serp += audit.serp_searches
-            total_score_gets += audit.candidate_score_gets
-            total_candidates_considered += audit.candidates_considered
-            if audit.skipped_time_budget:
-                leads_skipped_time += 1
-
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_resolve_one, item) for item in rows]
+        for future in as_completed(futures):
+            idx, best_domain, best_score, audit = future.result()
             result.at[idx, "website_domain"] = best_domain
-            result.at[idx, "domain_score"] = float(best_score)
-            if best_domain:
-                non_null += 1
+            result.at[idx, "domain_score"] = best_score
 
-            if i % DOMAIN_PROGRESS_LOG_EVERY == 0 or i == total:
-                logger.info(
-                    "Domain resolution progress: %d/%d rows processed; %d with non-null website_domain",
-                    i,
-                    total,
-                    non_null,
-                )
+            with progress_lock:
+                total_serp += audit.serp_searches
+                total_score_gets += audit.candidate_score_gets
+                total_candidates_considered += audit.candidates_considered
+                if audit.skipped_time_budget:
+                    leads_skipped_time += 1
+                if best_domain:
+                    non_null += 1
+                processed += 1
+                if processed % DOMAIN_PROGRESS_LOG_EVERY == 0 or processed == total:
+                    logger.info(
+                        "Domain resolution progress: %d/%d rows processed; %d with non-null website_domain",
+                        processed,
+                        total,
+                        non_null,
+                    )
 
     logger.info(
         "[STATS] domain_phase serp_searches=%d candidates_considered=%d "

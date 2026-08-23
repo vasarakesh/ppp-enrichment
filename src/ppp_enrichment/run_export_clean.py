@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import config
-from .domains import is_gov_or_edu_domain
+from .domains import email_host_matches_website, is_gov_or_edu_domain
 
 
 _CHUNK_SIZE = 500
@@ -152,7 +152,7 @@ def _normalize_host(host: object) -> str:
 
 
 def _email_domain_matches_website(email: object, website_domain: object) -> bool:
-    """Email @-domain must equal accepted website_domain (RULE 4 — not token overlap)."""
+    """Email @-domain must equal accepted website_domain or be a subdomain of it."""
     if pd.isna(email) or pd.isna(website_domain):
         return False
     text = str(email).strip().lower()
@@ -160,7 +160,7 @@ def _email_domain_matches_website(email: object, website_domain: object) -> bool
     if not text or "@" not in text or not host:
         return False
     email_host = _normalize_host(text.rsplit("@", 1)[1])
-    return email_host == host
+    return email_host_matches_website(email_host, host)
 
 
 def _email_contains_blocked_word(value: object) -> bool:

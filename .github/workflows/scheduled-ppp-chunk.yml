@@ -17,7 +17,7 @@ permissions:
 jobs:
   process-one-chunk:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 350
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,9 +32,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Process one chunk (scrapes web; may fail — chunk is kept)
+      - name: Process one chunk (scrapes web; may yield 0 leads — chunk kept on hard failure)
         env:
           PYTHONPATH: ${{ github.workspace }}
+          MAX_CONCURRENCY: "12"
+          CRAWLER_CONCURRENCY: "20"
+          DOMAIN_LEAD_TIME_LIMIT_SECONDS: "18"
+          CRAWLER_DELAY_PER_HOST: "0.2"
+          DDG_BACKENDS: duckduckgo,google,yahoo
         run: python scripts/ci_process_one_chunk.py
 
       - name: Commit clean results & chunk removal

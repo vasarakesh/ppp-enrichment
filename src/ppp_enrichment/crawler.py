@@ -40,6 +40,16 @@ _KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Tried when homepage HTML lacks about/contact/team links.
+_FALLBACK_PAGE_PATHS: tuple[tuple[str, str], ...] = (
+    ("/contact", "contact"),
+    ("/contact-us", "contact"),
+    ("/about", "about"),
+    ("/about-us", "about"),
+    ("/team", "team"),
+    ("/our-team", "team"),
+)
+
 # Small redirect cap per request (client-level).
 _CRAWLER_MAX_REDIRECTS = 5
 _NO_RETRY_STATUS_CODES = frozenset({403, 404, 410})
@@ -510,6 +520,24 @@ async def _crawl_single_domain(
     max_extra = max(0, max_pages - 1)
     raw_candidates = _extract_candidate_links(str(home_response.url), home_response.text or "")
     selected = _select_extra_page_urls(raw_candidates, max_extra)
+
+    # If nav links were sparse, probe common contact/about/team paths.
+    if len(selected) < max_extra:
+        have_types = {page_type for _, page_type in selected}
+        seen_keys = {_path_dedupe_key(url) for url, _ in selected}
+        base = str(home_response.url).rstrip("/") + "/"
+        for path, page_type in _FALLBACK_PAGE_PATHS:
+            if len(selected) >= max_extra:
+                break
+            if page_type in have_types:
+                continue
+            candidate_url = urljoin(base, path.lstrip("/"))
+            key = _path_dedupe_key(candidate_url)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            selected.append((candidate_url, page_type))
+            have_types.add(page_type)
 
     for candidate_url, page_type in selected:
         if _domain_time_exceeded():

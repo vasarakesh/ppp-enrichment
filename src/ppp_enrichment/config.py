@@ -43,28 +43,36 @@ GITHUB_CLEAN_RESULTS_DIR = BASE_DIR / "clean_github_results"
 CSV_WRITE_ENCODING = "utf-8-sig"
 
 # DuckDuckGo (domains stage): free search, no API key.
-DDG_MAX_RESULTS = 10
+DDG_MAX_RESULTS = 8
 DDG_REGION = "us-en"
 # ddgs text backends (primary, then fallbacks in domains.search_company_domains).
 # Config name ``google`` maps to ddgs id ``mullvad_google`` in domains._normalize_ddg_backend.
 DDG_PRIMARY_BACKEND = "duckduckgo"
 DDG_FALLBACK_BACKENDS = ("google", "yahoo")
 DDG_BACKENDS = "duckduckgo,google,yahoo"
-DOMAIN_LEAD_TIME_LIMIT_SECONDS = 15
-DOMAIN_MAX_CANDIDATES_TO_SCORE = 5
+DOMAIN_LEAD_TIME_LIMIT_SECONDS = 18
+DOMAIN_MAX_CANDIDATES_TO_SCORE = 4
+# Accept homepage-scored domains without a company-token-in-label match above this.
+DOMAIN_CONTENT_ONLY_MIN_SCORE = 0.52
+# Accept strong domain-label matches without an HTTP homepage GET.
+DOMAIN_LABEL_FAST_PATH_MIN_SCORE = 0.58
 
 # Resolver progress logs (borrowers processed between messages).
 DOMAIN_PROGRESS_LOG_EVERY = 25
 
 # HTTP timeouts (seconds) — shared by domain scoring and site crawler.
-HTTP_REQUEST_TIMEOUT_SECONDS = 5
+HTTP_REQUEST_TIMEOUT_SECONDS = 6
 
 # Crawler: cap pages per host (home + extras) and per-domain wall clock.
-CRAWLER_MAX_PAGES_PER_DOMAIN = 4  # home + up to 3 internal links
+CRAWLER_MAX_PAGES_PER_DOMAIN = 5  # home + up to 4 internal / fallback paths
 CRAWLER_REQUEST_TIMEOUT = HTTP_REQUEST_TIMEOUT_SECONDS
-CRAWLER_PER_DOMAIN_TIME_LIMIT_SECONDS = 15
+CRAWLER_PER_DOMAIN_TIME_LIMIT_SECONDS = 20
 CRAWLER_MAX_RETRIES = 1  # extra attempts after the first (403/404/410 are never retried)
 CRAWLER_MAX_REQUESTS_PER_RUN = 20_000
+CRAWLER_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (compatible; PPPEnrichment/1.1; +https://github.com/ppp-enrichment)"
+    " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,8 @@ class AppConfig:
     domain_lead_time_limit_seconds: int
     domain_max_candidates_to_score: int
     domain_min_score_threshold: float
+    domain_content_only_min_score: float
+    domain_label_fast_path_min_score: float
     log_level: str
     max_concurrency: int
     request_timeout_seconds: int
@@ -137,13 +147,22 @@ def get_config() -> AppConfig:
                 str(DOMAIN_MAX_CANDIDATES_TO_SCORE),
             )
         ),
-        domain_min_score_threshold=float(os.getenv("DOMAIN_MIN_SCORE_THRESHOLD", "0.38")),
+        domain_min_score_threshold=float(os.getenv("DOMAIN_MIN_SCORE_THRESHOLD", "0.34")),
+        domain_content_only_min_score=float(
+            os.getenv("DOMAIN_CONTENT_ONLY_MIN_SCORE", str(DOMAIN_CONTENT_ONLY_MIN_SCORE))
+        ),
+        domain_label_fast_path_min_score=float(
+            os.getenv(
+                "DOMAIN_LABEL_FAST_PATH_MIN_SCORE",
+                str(DOMAIN_LABEL_FAST_PATH_MIN_SCORE),
+            )
+        ),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
-        max_concurrency=int(os.getenv("MAX_CONCURRENCY", "10")),
+        max_concurrency=int(os.getenv("MAX_CONCURRENCY", "16")),
         request_timeout_seconds=int(
             os.getenv("REQUEST_TIMEOUT_SECONDS", str(HTTP_REQUEST_TIMEOUT_SECONDS))
         ),
-        crawler_concurrency=int(os.getenv("CRAWLER_CONCURRENCY", "15")),
+        crawler_concurrency=int(os.getenv("CRAWLER_CONCURRENCY", "24")),
         crawler_per_host_concurrency=int(os.getenv("CRAWLER_PER_HOST_CONCURRENCY", "2")),
         crawler_max_pages_per_domain=int(
             os.getenv("CRAWLER_MAX_PAGES_PER_DOMAIN", str(CRAWLER_MAX_PAGES_PER_DOMAIN))
@@ -151,11 +170,8 @@ def get_config() -> AppConfig:
         crawler_request_timeout=float(
             os.getenv("CRAWLER_REQUEST_TIMEOUT", str(CRAWLER_REQUEST_TIMEOUT))
         ),
-        crawler_user_agent=os.getenv(
-            "CRAWLER_USER_AGENT",
-            "PPP-EnrichmentBot/1.0 (+https://example.com/bot)",
-        ),
-        crawler_delay_per_host=float(os.getenv("CRAWLER_DELAY_PER_HOST", "0.5")),
+        crawler_user_agent=os.getenv("CRAWLER_USER_AGENT", CRAWLER_DEFAULT_USER_AGENT),
+        crawler_delay_per_host=float(os.getenv("CRAWLER_DELAY_PER_HOST", "0.2")),
         crawler_max_retries=int(os.getenv("CRAWLER_MAX_RETRIES", str(CRAWLER_MAX_RETRIES))),
         crawler_max_requests_per_run=int(
             os.getenv("CRAWLER_MAX_REQUESTS_PER_RUN", str(CRAWLER_MAX_REQUESTS_PER_RUN))

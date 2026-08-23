@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
-from .domains import is_gov_or_edu_domain
+from .domains import email_host_matches_website, is_gov_or_edu_domain
 from .extract import ContactInfo, PersonCandidate
 from .logging_utils import get_logger
 
@@ -139,7 +139,9 @@ def _generic_prefix_rank(email: str) -> tuple[int, str]:
 
 def _candidate_sort_score(candidate: PersonCandidate, company_domain: str) -> tuple[float, float]:
     email = candidate.email
-    domain_match = bool(company_domain and _email_domain(email) == company_domain)
+    domain_match = bool(
+        company_domain and email_host_matches_website(_email_domain(email), company_domain)
+    )
     role_boost = 1.5 if _has_explicit_owner_role(candidate.role) else 0.0
     email_boost = 1.0 if email else 0.0
     domain_boost = 1.0 if domain_match else 0.0
@@ -149,7 +151,10 @@ def _candidate_sort_score(candidate: PersonCandidate, company_domain: str) -> tu
 
 
 def _leadership_priority(candidate: PersonCandidate, company_domain: str) -> tuple[bool, float]:
-    on_domain = bool(company_domain and _email_domain(candidate.email) == company_domain)
+    on_domain = bool(
+        company_domain
+        and email_host_matches_website(_email_domain(candidate.email), company_domain)
+    )
     return on_domain, float(candidate.score)
 
 
@@ -254,7 +259,7 @@ def choose_best_contact(
             return False
         if not company_domain:
             return True
-        return _email_domain(email) == company_domain
+        return email_host_matches_website(_email_domain(email), company_domain)
 
     candidates = [
         cand
@@ -296,7 +301,10 @@ def choose_best_contact(
     if ownership_pool:
         selected = max(ownership_pool, key=lambda cand: _leadership_priority(cand, company_domain))
         first_name, last_name = _person_names_from_candidate(selected)
-        on_domain = bool(company_domain and _email_domain(selected.email) == company_domain)
+        on_domain = bool(
+            company_domain
+            and email_host_matches_website(_email_domain(selected.email), company_domain)
+        )
         conf_key = (
             "explicit_owner_company_domain" if on_domain else "explicit_owner_foreign_domain"
         )

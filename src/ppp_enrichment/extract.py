@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 
 from .crawler import PageContent
-from .domains import is_gov_or_edu_domain
+from .domains import email_host_matches_website, is_gov_or_edu_domain
 from .logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -123,8 +123,7 @@ def _email_on_domain(email: str, accepted_domain: str) -> bool:
     if "@" not in email:
         return False
     email_host = _normalize_host(email.rsplit("@", 1)[1])
-    accepted = _normalize_host(accepted_domain)
-    return bool(email_host and accepted and email_host == accepted)
+    return email_host_matches_website(email_host, accepted_domain)
 
 
 def extract_emails(
@@ -176,7 +175,8 @@ def extract_emails(
     domain_hits = [
         e
         for e in ordered
-        if _normalize_host(e.rsplit("@", 1)[-1]) == dom and not is_gov_or_edu_domain(e)
+        if email_host_matches_website(_normalize_host(e.rsplit("@", 1)[-1]), dom)
+        and not is_gov_or_edu_domain(e.rsplit("@", 1)[-1])
     ]
     if same_domain_only:
         return domain_hits
@@ -262,7 +262,7 @@ def _score_candidate(
     if email:
         score += 1.5
         email_domain = _normalize_host(email.split("@", 1)[1]) if "@" in email else ""
-        if company_domain and email_domain == company_domain:
+        if company_domain and email_host_matches_website(email_domain, company_domain):
             score += 3.0
     if phone:
         score += 1.0

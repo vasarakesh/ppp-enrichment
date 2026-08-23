@@ -6,6 +6,7 @@ Run from repo root with PYTHONPATH=.
     PYTHONPATH=. python scripts/ci_process_one_chunk.py
 
 Exits 0 immediately if no ``data/input/queue/ppp-war_part*.csv`` files remain.
+A run that produces 0 clean leads still exits 0 (writes/copies an empty CSV).
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ def main() -> int:
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(root))
+    # Throughput / yield knobs for GitHub-hosted runners.
+    env.setdefault("MAX_CONCURRENCY", "12")
+    env.setdefault("CRAWLER_CONCURRENCY", "20")
+    env.setdefault("DOMAIN_LEAD_TIME_LIMIT_SECONDS", "18")
+    env.setdefault("CRAWLER_DELAY_PER_HOST", "0.2")
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest_clean = clean_dir / f"{chunk.stem}_{ts}.csv"
 
@@ -53,20 +59,31 @@ def main() -> int:
             "-m",
             "src.ppp_enrichment.run_pipeline",
             "--leads",
-            "2000",
+            "500",
             "--oversample-factor",
-            "3",
+            "5",
             "--run-dir",
             str(run_dir),
         ]
-        subprocess.run(cmd, cwd=root, env=env, check=True)
+        completed = subprocess.run(cmd, cwd=root, env=env, check=False)
+        if completed.returncode != 0:
+            print(
+                f"Pipeline exited with code {completed.returncode}; "
+                "leaving chunk in place for retry."
+            )
+            return completed.returncode
 
         out_dir = root / "data" / "output"
         clean_files = sorted(out_dir.glob("clean_leads_*.csv"), key=lambda p: p.stat().st_mtime)
         if not clean_files:
-            raise RuntimeError(f"No clean_leads_*.csv in {out_dir}")
-        shutil.copy2(clean_files[-1], dest_clean)
-        print(f"Clean export copied to {dest_clean.relative_to(root)}")
+            print(f"No clean_leads_*.csv in {out_dir}; writing empty result stub.")
+            dest_clean.write_text(
+                "First Name,Second Name,Email Address,Phone Number,Company Name,Company URL\n",
+                encoding="utf-8",
+            )
+        else:
+            shutil.copy2(clean_files[-1], dest_clean)
+            print(f"Clean export copied to {dest_clean.relative_to(root)}")
 
     return 0
 

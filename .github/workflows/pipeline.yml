@@ -50,7 +50,11 @@ jobs:
         if: steps.check_queue.outputs.chunks_available != '0'
         env:
           DDG_BACKENDS: duckduckgo,google,yahoo
-          DOMAIN_LEAD_TIME_LIMIT_SECONDS: "20"
+          DOMAIN_LEAD_TIME_LIMIT_SECONDS: "18"
+          MAX_CONCURRENCY: "12"
+          CRAWLER_CONCURRENCY: "20"
+          CRAWLER_DELAY_PER_HOST: "0.2"
+          DOMAIN_MIN_SCORE_THRESHOLD: "0.34"
         run: python -m src.ppp_enrichment.run_pipeline --leads 500 --oversample-factor 5
 
       - name: Commit clean output and deleted chunk back to repo

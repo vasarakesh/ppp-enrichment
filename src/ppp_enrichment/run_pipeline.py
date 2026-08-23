@@ -375,8 +375,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--oversample-factor",
         type=float,
-        default=3.0,
-        help="Borrower sample size = int(leads * factor) to absorb attrition (default: 3.0).",
+        default=5.0,
+        help="Borrower sample size = int(leads * factor) to absorb attrition (default: 5.0).",
     )
     parser.add_argument(
         "--ppp-csv",
@@ -592,14 +592,21 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         if enriched is None or len(enriched) == 0:
-            print("[CLEAN] No enriched rows this run; skipping clean_leads export.")
-            logger.warning("[CLEAN] No enriched rows; updating chunk only.")
+            print("[CLEAN] No enriched rows this run; writing empty clean_leads export.")
+            logger.warning("[CLEAN] No enriched rows; writing empty clean CSV and updating chunk.")
+            config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            utc_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
+            clean_path = config.OUTPUT_DIR / f"clean_leads_{utc_stamp}.csv"
+            empty_out = pd.DataFrame(columns=[display for display, _ in _CLEAN_COLS])
+            empty_out.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
             remaining_n, chunk_status = _update_chunk_file(
                 ppp_csv_path, raw_sample, full_df, processed, target_borrowers
             )
             print(f"Target leads: {leads}")
             print(f"Target borrower rows: {target_borrowers}")
             print(f"Actual leads processed: {processed}")
+            print(f"Clean leads produced: 0")
+            print(f"Clean leads file (UTC): {clean_path}")
             print(f"Remaining in chunk: {remaining_n}")
             print(f"Chunk status: {chunk_status}")
             print("=== RUN COMPLETE (no enrichment) ===")
@@ -650,8 +657,10 @@ def main(argv: list[str] | None = None) -> None:
             clean_df.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
             logger.info("Clean export: %s rows -> %s", clean_count, clean_path)
         else:
-            logger.warning("Clean export produced 0 rows; no CSV written.")
-            clean_path = None
+            # Always write a file so CI/schedulers do not treat "0 leads" as a hard failure.
+            empty_out = pd.DataFrame(columns=[display for display, _ in _CLEAN_COLS])
+            empty_out.to_csv(clean_path, index=False, encoding=config.CSV_WRITE_ENCODING)
+            logger.warning("Clean export produced 0 rows; wrote empty CSV -> %s", clean_path)
 
         try:
             files_after = os.listdir("data/output/")
